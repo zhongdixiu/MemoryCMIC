@@ -1,0 +1,38 @@
+{
+  "model_version": "V1.0",
+  "batch": "engineering_and_database_baseline",
+  "status": "passed",
+  "environment": {
+    "python": "3.12.10",
+    "poetry": "2.4.1",
+    "postgresql": "15.17",
+    "pgvector": "0.8.2",
+    "docker_compose": "2.32.4-desktop.1"
+  },
+  "database": {
+    "name": "memory_cmic",
+    "user": "memory_cmic",
+    "host_port": 5433,
+    "container_port": 5432,
+    "volume": "memory_cmic_pgdata",
+    "runtime_tables": 7,
+    "migration_tables": 1,
+    "non_primary_indexes": 27,
+    "constraints": 54
+  },
+  "checks": {
+    "upgrade": "passed",
+    "downgrade": "passed",
+    "second_upgrade": "passed",
+    "metadata_drift": "none",
+    "schema_tests": {
+      "passed": 17,
+      "failed": 0
+    },
+    "ruff": "passed",
+    "poetry": "passed",
+    "volume_restart_persistence": "passed",
+    "honcho_container_unchanged": true
+  },
+  "overall_model_go_no_go": "not_evaluated"
+}

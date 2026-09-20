@@ -2,6 +2,7 @@
 # Python 编译产物
 # ===========================
 .pytest_cache/
+.ruff_cache/
 *.pyc
 __pycache__/
 *.py[cod]
@@ -62,6 +63,7 @@ env/
 .env/
 virtualenv/
 pythonenv/
+.venv/
 
 # ===========================
 # 测试 & 覆盖率
@@ -104,4 +106,3 @@ dmypy.json
 # pip
 pip-log.txt
 pip-delete-this-directory.txt
-

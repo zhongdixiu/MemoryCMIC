@@ -1,0 +1,25 @@
+name: memory-cmic
+
+services:
+  postgres:
+    image: ${MEMORY_POSTGRES_IMAGE:-pgvector/pgvector:pg15}
+    container_name: memory-cmic-postgres
+    environment:
+      POSTGRES_DB: ${MEMORY_POSTGRES_DB:-memory_cmic}
+      POSTGRES_USER: ${MEMORY_POSTGRES_USER:-memory_cmic}
+      POSTGRES_PASSWORD: ${MEMORY_POSTGRES_PASSWORD:?set MEMORY_POSTGRES_PASSWORD in .env}
+    ports:
+      - "${MEMORY_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - memory_cmic_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${MEMORY_POSTGRES_USER:-memory_cmic} -d ${MEMORY_POSTGRES_DB:-memory_cmic}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  memory_cmic_pgdata:
+    name: memory_cmic_pgdata
