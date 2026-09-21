@@ -11,7 +11,10 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{ include = "memory_cmic", from = "src" }]
+packages = [
+    { include = "memory_cmic", from = "src" },
+    { include = "migration_tools", from = "src" },
+]
 
 [dependency-groups]
 dev = [
