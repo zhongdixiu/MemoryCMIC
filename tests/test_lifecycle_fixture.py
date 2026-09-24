@@ -70,7 +70,7 @@ def test_deterministic_embedding_is_stable_and_normalized() -> None:
     other_model = deterministic_embedding("相同的虚构文本", "fake-embedding-v2")
     assert first == second
     assert first != other_model
-    assert len(first) == 1536
+    assert len(first) == 1024
     assert math.sqrt(sum(value * value for value in first)) == pytest.approx(1.0)
 
     similar = deterministic_embedding("相同的虚构文本用于测试", "fake-embedding-v1")

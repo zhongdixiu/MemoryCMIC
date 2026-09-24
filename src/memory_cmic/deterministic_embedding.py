@@ -4,7 +4,7 @@ import hashlib
 import math
 
 
-def deterministic_embedding(text: str, model_id: str, dimensions: int = 1536) -> list[float]:
+def deterministic_embedding(text: str, model_id: str, dimensions: int = 1024) -> list[float]:
     """Return a deterministic, local-only unit vector for validation tests."""
     if dimensions <= 0:
         raise ValueError("dimensions must be positive")

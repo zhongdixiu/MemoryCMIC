@@ -23,7 +23,7 @@
   "fixture_directives": {
     "$sha256(<field>)": "加载器在写库前对指定 UTF-8 文本计算小写十六进制 SHA-256。",
     "$memory_text": "summary + '\n' + content。",
-    "$deterministic_embedding": "加载器使用 text 与 model_id 生成 1536 维确定性单位向量。",
+    "$deterministic_embedding": "加载器使用 text 与 model_id 生成 1024 维确定性单位向量。",
     "generated_columns": "memory_audit_log.id 与数据库默认时间列可由数据库生成；本文件显式时间用于稳定断言。"
   },
   "normalization_examples": [

@@ -41,6 +41,14 @@ class SourceRecord(Base):
             name="uq_source_record_external_ref",
         ),
         UniqueConstraint("tenant_id", "id", name="uq_source_record_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "source_system",
+            "user_id",
+            "session_id",
+            "message_id",
+            name="uq_source_record_message",
+        ),
         CheckConstraint("version > 0", name="ck_source_record_version_positive"),
         CheckConstraint(
             "source_type IN ('chat', 'doc', 'tool', 'manual', 'legacy_import')",
@@ -60,17 +68,21 @@ class SourceRecord(Base):
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     source_system: Mapped[str] = mapped_column(String(64), nullable=False)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[str | None] = mapped_column(String(128))
     session_id: Mapped[str | None] = mapped_column(String(128))
+    message_id: Mapped[str | None] = mapped_column(String(256))
     external_ref_id: Mapped[str] = mapped_column(String(128), nullable=False)
     author_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    author_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    author_id: Mapped[str] = mapped_column(String(128), nullable=False)
     raw_content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    semantic_hash: Mapped[str | None] = mapped_column(String(64))
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'active'")
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    processed_version: Mapped[int | None] = mapped_column(Integer)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -88,6 +100,37 @@ Index(
     SourceRecord.author_id,
     SourceRecord.occurred_at.desc(),
 )
+Index(
+    "ix_source_record_conversation",
+    SourceRecord.tenant_id,
+    SourceRecord.source_system,
+    SourceRecord.user_id,
+    SourceRecord.session_id,
+)
+
+
+class ConversationSession(Base):
+    __tablename__ = "conversation_session"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "tenant_id", "source_system", "session_id", name="pk_conversation_session"
+        ),
+        CheckConstraint("next_batch_seq > 0", name="ck_conversation_next_batch_seq_positive"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    next_batch_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
 
 
 class MemoryItem(Base):
@@ -125,12 +168,13 @@ class MemoryItem(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     subject_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(128), nullable=False)
     cognitive_type: Mapped[str] = mapped_column(String(32), nullable=False)
     business_domains: Mapped[list[str] | None] = mapped_column(ARRAY(String(32)))
     project_domains: Mapped[list[str] | None] = mapped_column(ARRAY(String(64)))
     summary: Mapped[str] = mapped_column(String(512), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    semantic_hash: Mapped[str | None] = mapped_column(String(64))
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB)
     confidence: Mapped[Decimal] = mapped_column(
         Numeric(4, 3), nullable=False, server_default=text("1.000")
@@ -168,6 +212,14 @@ Index(
     postgresql_where=text("status = 'active'"),
 )
 Index("ix_memory_item_conflict_group", MemoryItem.tenant_id, MemoryItem.conflict_group_id)
+Index(
+    "ix_memory_item_fact_hash",
+    MemoryItem.tenant_id,
+    MemoryItem.subject_type,
+    MemoryItem.subject_id,
+    MemoryItem.semantic_hash,
+    postgresql_where=text("status = 'active' AND semantic_hash IS NOT NULL"),
+)
 
 
 class ProfileProperty(Base):
@@ -192,7 +244,7 @@ class ProfileProperty(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     business_domains: Mapped[list[str] | None] = mapped_column(ARRAY(String(32)))
     property_key: Mapped[str] = mapped_column(String(128), nullable=False)
     property_value: Mapped[dict[str, Any] | list[Any] | str | int | float | bool] = mapped_column(
@@ -350,7 +402,7 @@ class MemoryEmbedding(Base):
     memory_id: Mapped[str] = mapped_column(String(64), nullable=False)
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(1024), nullable=False)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'active'")
     )
@@ -374,7 +426,13 @@ Index(
 class MemoryTask(Base):
     __tablename__ = "memory_task"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "idempotency_key", name="uq_memory_task_idempotency"),
+        UniqueConstraint("tenant_id", "id", name="uq_memory_task_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "caller_agent_id",
+            "idempotency_key",
+            name="uq_memory_task_idempotency",
+        ),
         CheckConstraint("attempt_count >= 0", name="ck_task_attempt_count"),
         CheckConstraint("max_attempts > 0", name="ck_task_max_attempts"),
         CheckConstraint("priority IN (0, 50, 100)", name="ck_task_priority"),
@@ -388,7 +446,7 @@ class MemoryTask(Base):
             name="ck_task_target_type",
         ),
         CheckConstraint(
-            "status IN ('pending', 'processing', 'succeeded', 'failed', 'cancelled')",
+            "status IN ('pending', 'processing', 'succeeded', 'partial', 'failed', 'cancelled')",
             name="ck_task_status",
         ),
         CheckConstraint(
@@ -403,11 +461,19 @@ class MemoryTask(Base):
     target_type: Mapped[str] = mapped_column(String(32), nullable=False)
     target_id: Mapped[str] = mapped_column(String(128), nullable=False)
     input_version: Mapped[int | None] = mapped_column(Integer)
+    caller_agent_id: Mapped[str | None] = mapped_column(String(128))
     idempotency_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
     correlation_id: Mapped[str | None] = mapped_column(String(64))
+    source_system: Mapped[str | None] = mapped_column(String(64))
+    user_id: Mapped[str | None] = mapped_column(String(128))
+    session_id: Mapped[str | None] = mapped_column(String(128))
+    batch_seq: Mapped[int | None] = mapped_column(BigInteger)
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    result_json: Mapped[list[dict[str, Any]] | None] = mapped_column("result", JSONB)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column("error", JSONB)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'pending'")
     )
@@ -421,6 +487,7 @@ class MemoryTask(Base):
     )
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     worker_id: Mapped[str | None] = mapped_column(String(128))
+    lease_token: Mapped[str | None] = mapped_column(String(64))
     last_error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -439,6 +506,61 @@ Index(
     MemoryTask.available_at,
     MemoryTask.created_at,
     postgresql_where=text("status = 'pending'"),
+)
+Index(
+    "ix_memory_task_conversation",
+    MemoryTask.tenant_id,
+    MemoryTask.source_system,
+    MemoryTask.user_id,
+    MemoryTask.session_id,
+    MemoryTask.batch_seq,
+)
+
+
+class MemoryTaskSource(Base):
+    __tablename__ = "memory_task_source"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "tenant_id", "task_id", "source_id", name="pk_memory_task_source"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "task_id"],
+            ["memory_task.tenant_id", "memory_task.id"],
+            name="fk_memory_task_source_task",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "source_id"],
+            ["source_record.tenant_id", "source_record.id"],
+            name="fk_memory_task_source_source",
+        ),
+        CheckConstraint("source_version > 0", name="ck_task_source_version_positive"),
+        CheckConstraint("kind IN ('target', 'history')", name="ck_task_source_kind"),
+        CheckConstraint("position >= 0", name="ck_task_source_position_nonnegative"),
+        CheckConstraint(
+            "status IN ('pending', 'processed', 'skipped')", name="ck_task_source_status"
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'pending'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+Index(
+    "ix_memory_task_source_source",
+    MemoryTaskSource.tenant_id,
+    MemoryTaskSource.source_id,
+    MemoryTaskSource.kind,
 )
 Index(
     "ix_memory_task_correlation",
@@ -471,7 +593,7 @@ class MemoryAuditLog(Base):
     target_type: Mapped[str] = mapped_column(String(32), nullable=False)
     target_id: Mapped[str] = mapped_column(String(128), nullable=False)
     operator_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    operator_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    operator_id: Mapped[str] = mapped_column(String(128), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(512))
     correlation_id: Mapped[str | None] = mapped_column(String(64))

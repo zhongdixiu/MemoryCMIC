@@ -303,7 +303,7 @@ def test_embedding_primary_key_prevents_duplicate_model(connection: Connection) 
             tenant_id, memory_id, model_id, content_hash, embedding
         ) VALUES (
             'tenant_a', 'mem_embedding', 'test-model', 'hash',
-            array_fill(0::real, ARRAY[1536])::vector
+            array_fill(0::real, ARRAY[1024])::vector
         )
         """
     )

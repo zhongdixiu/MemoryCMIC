@@ -10,9 +10,16 @@ from memory_cmic.models import MemoryItem, MemoryTask
 
 
 def enqueue_task(session: Session, data: Mapping[str, Any]) -> MemoryTask:
+    caller_agent_id = data.get("caller_agent_id")
+    caller_filter = (
+        MemoryTask.caller_agent_id == caller_agent_id
+        if caller_agent_id is not None
+        else MemoryTask.caller_agent_id.is_(None)
+    )
     existing = session.scalars(
         select(MemoryTask).where(
             MemoryTask.tenant_id == data["tenant_id"],
+            caller_filter,
             MemoryTask.idempotency_key == data["idempotency_key"],
         )
     ).one_or_none()
@@ -44,21 +51,38 @@ def claim_tasks(
                 """
                 WITH candidates AS (
                     SELECT id
-                    FROM memory_task
-                    WHERE tenant_id = :tenant_id
+                    FROM memory_task AS candidate
+                    WHERE candidate.tenant_id = :tenant_id
                       AND (
-                           (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-                        OR (status = 'processing'
-                            AND locked_until < CURRENT_TIMESTAMP
-                            AND attempt_count < max_attempts)
+                           (candidate.status = 'pending'
+                            AND candidate.available_at <= CURRENT_TIMESTAMP)
+                        OR (candidate.status = 'processing'
+                            AND candidate.locked_until < CURRENT_TIMESTAMP
+                            AND candidate.attempt_count < candidate.max_attempts)
                       )
-                    ORDER BY priority DESC, available_at ASC, created_at ASC
+                      AND (
+                          candidate.session_id IS NULL
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM memory_task AS prior
+                              WHERE prior.tenant_id = candidate.tenant_id
+                                AND prior.source_system = candidate.source_system
+                                AND prior.user_id = candidate.user_id
+                                AND prior.session_id = candidate.session_id
+                                AND prior.batch_seq < candidate.batch_seq
+                                AND prior.status IN ('pending', 'processing')
+                          )
+                      )
+                    ORDER BY candidate.priority DESC,
+                             candidate.available_at ASC,
+                             candidate.created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT :limit
                 )
                 UPDATE memory_task AS task
                 SET status = 'processing',
                     worker_id = :worker_id,
+                    lease_token = md5(random()::text || clock_timestamp()::text || task.id),
                     locked_until = CURRENT_TIMESTAMP
                                    + make_interval(secs => :lease_seconds),
                     attempt_count = CASE
@@ -135,6 +159,7 @@ def complete_task(
     tenant_id: str,
     task_id: str,
     worker_id: str,
+    lease_token: str | None = None,
 ) -> bool:
     result = session.execute(
         text(
@@ -147,10 +172,17 @@ def complete_task(
               AND id = :task_id
               AND status = 'processing'
               AND worker_id = :worker_id
+              AND (CAST(:lease_token AS VARCHAR) IS NULL
+                   OR lease_token = CAST(:lease_token AS VARCHAR))
               AND locked_until > CURRENT_TIMESTAMP
             """
         ),
-        {"tenant_id": tenant_id, "task_id": task_id, "worker_id": worker_id},
+        {
+            "tenant_id": tenant_id,
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "lease_token": lease_token,
+        },
     )
     session.expire_all()
     return result.rowcount == 1
@@ -163,6 +195,8 @@ def fail_and_retry_task(
     task_id: str,
     worker_id: str,
     error: str,
+    error_code: str = "EXTRACTION_FAILED",
+    lease_token: str | None = None,
     base_backoff_seconds: int = 1,
 ) -> MemoryTask | None:
     if base_backoff_seconds <= 0:
@@ -190,16 +224,30 @@ def fail_and_retry_task(
                     WHEN attempt_count + 1 >= max_attempts THEN locked_until
                     ELSE NULL
                 END,
+                lease_token = CASE
+                    WHEN attempt_count + 1 >= max_attempts THEN lease_token
+                    ELSE NULL
+                END,
                 completed_at = CASE
                     WHEN attempt_count + 1 >= max_attempts THEN CURRENT_TIMESTAMP
                     ELSE NULL
                 END,
                 last_error = :error,
+                error = CASE
+                    WHEN attempt_count + 1 >= max_attempts
+                    THEN jsonb_build_object(
+                        'code', CAST(:error_code AS TEXT),
+                        'message', CAST(:error AS TEXT)
+                    )
+                    ELSE NULL
+                END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE tenant_id = :tenant_id
               AND id = :task_id
               AND status = 'processing'
               AND worker_id = :worker_id
+              AND (CAST(:lease_token AS VARCHAR) IS NULL
+                   OR lease_token = CAST(:lease_token AS VARCHAR))
               AND locked_until > CURRENT_TIMESTAMP
             RETURNING id
             """
@@ -209,6 +257,8 @@ def fail_and_retry_task(
             "task_id": task_id,
             "worker_id": worker_id,
             "error": error,
+            "error_code": error_code,
+            "lease_token": lease_token,
             "base_backoff_seconds": base_backoff_seconds,
         },
     ).scalar_one_or_none()
@@ -216,6 +266,41 @@ def fail_and_retry_task(
         return None
     session.expire_all()
     return session.get(MemoryTask, returned_id)
+
+
+def finish_task(
+    session: Session,
+    *,
+    tenant_id: str,
+    task_id: str,
+    worker_id: str,
+    lease_token: str,
+    status: str,
+    results: list[dict[str, Any]],
+    error: dict[str, str] | None = None,
+) -> bool:
+    if status not in {"succeeded", "partial", "failed", "cancelled"}:
+        raise ValueError("invalid terminal task status")
+    result = session.execute(
+        update(MemoryTask)
+        .where(
+            MemoryTask.tenant_id == tenant_id,
+            MemoryTask.id == task_id,
+            MemoryTask.status == "processing",
+            MemoryTask.worker_id == worker_id,
+            MemoryTask.lease_token == lease_token,
+            MemoryTask.locked_until > func.current_timestamp(),
+        )
+        .values(
+            status=status,
+            result_json=results,
+            error_json=error,
+            completed_at=func.current_timestamp(),
+            updated_at=func.current_timestamp(),
+        )
+    )
+    session.expire_all()
+    return result.rowcount == 1
 
 
 def apply_memory_content_if_current(
