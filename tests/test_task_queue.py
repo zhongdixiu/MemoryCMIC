@@ -511,3 +511,49 @@ def test_t19_tasks_and_audits_inherit_root_correlation(session: Session) -> None
     assert "correlation_id" not in MemoryItem.__table__.columns
     assert "correlation_id" not in SourceRecord.__table__.columns
     assert "correlation_id" not in ProfileProperty.__table__.columns
+
+def test_renewal_rejects_old_token_after_same_worker_takeover(session):
+    now = _database_now(session)
+    task = enqueue_task(
+        session,
+        {
+            **_pending_task(task_id="token_renewal", tenant_id="tenant_token_renewal"),
+            "status": "processing",
+            "worker_id": "same_worker",
+            "lease_token": "old_token",
+            "locked_until": now - timedelta(seconds=1),
+            "started_at": now,
+        },
+    )
+    claimed = claim_tasks(session, tenant_id=task.tenant_id, worker_id="same_worker")
+    current_token = claimed[0].lease_token
+    assert current_token != "old_token"
+    assert not renew_task_lease(
+        session,
+        tenant_id=task.tenant_id,
+        task_id=task.id,
+        worker_id="same_worker",
+        lease_token="old_token",
+        lease_seconds=120,
+    )
+    assert renew_task_lease(
+        session,
+        tenant_id=task.tenant_id,
+        task_id=task.id,
+        worker_id="same_worker",
+        lease_token=current_token,
+        lease_seconds=120,
+    )
+    assert not complete_task(
+        session,
+        tenant_id=task.tenant_id,
+        task_id=task.id,
+        worker_id="same_worker",
+        lease_token="old_token",
+    )
+
+
+def test_claim_empty_supported_types_leaves_queue_pending(session):
+    task = enqueue_task(session, _pending_task(task_id="empty_types", tenant_id="empty_types"))
+    assert claim_tasks(session, tenant_id=task.tenant_id, worker_id="unused", task_types=()) == []
+    assert task.status == "pending"

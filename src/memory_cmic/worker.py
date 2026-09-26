@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import signal
 import time
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from threading import Event, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +17,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from memory_cmic.db import create_database_engine
+from memory_cmic.extraction_input import ExtractionBudget, build_slices, input_size, split_slice
+from memory_cmic.lifecycle import govern_memory
 from memory_cmic.models import (
     MemoryAuditLog,
     MemoryEmbedding,
@@ -23,24 +29,42 @@ from memory_cmic.models import (
     SourceRecord,
 )
 from memory_cmic.providers import (
+    EXTRACTION_PROMPT,
+    GOVERNANCE_PROMPT,
+    PROMPT_VERSION,
     Embedder,
     ExtractedFact,
     FactModel,
+    GovernanceDecision,
+    OutputLimitError,
     ProviderError,
     QwenFactModel,
     SiliconFlowEmbedder,
+    candidate_skip_reason,
+    validate_fact_evidence,
 )
 from memory_cmic.settings import Settings
-from memory_cmic.task_queue import claim_tasks, fail_and_retry_task, finish_task
+from memory_cmic.task_queue import (
+    claim_tasks,
+    fail_and_retry_task,
+    finish_task,
+    renew_task_lease,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class WorkerInputError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, committed_changes: bool = False):
+        super().__init__(message)
+        self.committed_changes = committed_changes
 
 
 class LeaseLostError(RuntimeError):
+    pass
+
+
+class ModelCallBudgetError(WorkerInputError):
     pass
 
 
@@ -56,13 +80,58 @@ class TaskInput:
     targets: list[dict[str, Any]]
     history: list[dict[str, Any]]
     source_ids: dict[str, str]
+    task_signature: str
+    associations: tuple[tuple[str, str, int, int], ...]
+    source_states: dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True)
 class FactDecision:
     fact: ExtractedFact
     embedding: list[float]
-    duplicate_memory_id: str | None
+    governance: GovernanceDecision
+    scope_fingerprint: str
+    memory_id: str
+    conflict_group_id: str | None
+
+
+@contextmanager
+def _lease_heartbeat(
+    session_factory: sessionmaker[Session],
+    *,
+    tenant_id: str,
+    task_id: str,
+    worker_id: str,
+    lease_token: str,
+    lease_seconds: int,
+) -> Iterator[None]:
+    stopping = Event()
+
+    def renew():
+        while not stopping.wait(lease_seconds / 3):
+            try:
+                with session_factory.begin() as session:
+                    renewed = renew_task_lease(
+                        session,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        worker_id=worker_id,
+                        lease_token=lease_token,
+                        lease_seconds=lease_seconds,
+                    )
+                if not renewed:
+                    return
+            except Exception:
+                logger.exception("lease renewal failed for task %s", task_id)
+                return
+
+    thread = Thread(target=renew, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopping.set()
+        thread.join()
 
 
 def _normalized_fact(value: str) -> str:
@@ -86,6 +155,7 @@ def _source_message(source: SourceRecord) -> dict[str, Any]:
         "occurred_at": source.occurred_at.isoformat(),
         "author_id": source.author_id,
         "tool_status": metadata.get("tool_status"),
+        "reply_to_message_id": metadata.get("reply_to_message_id"),
     }
 
 
@@ -137,37 +207,39 @@ def _load_task_input(session: Session, task: MemoryTask) -> TaskInput:
         for association, source in history_rows
         if source.status == "active" and source.version == association.source_version
     ]
-    previous_rows = session.execute(
-        select(SourceRecord)
-        .join(
-            MemoryTaskSource,
-            (MemoryTaskSource.tenant_id == SourceRecord.tenant_id)
-            & (MemoryTaskSource.source_id == SourceRecord.id),
+    previous_rows = (
+        session.execute(
+            select(SourceRecord)
+            .join(
+                MemoryTaskSource,
+                (MemoryTaskSource.tenant_id == SourceRecord.tenant_id)
+                & (MemoryTaskSource.source_id == SourceRecord.id),
+            )
+            .join(
+                MemoryTask,
+                (MemoryTask.tenant_id == MemoryTaskSource.tenant_id)
+                & (MemoryTask.id == MemoryTaskSource.task_id),
+            )
+            .where(
+                MemoryTask.tenant_id == task.tenant_id,
+                MemoryTask.source_system == task.source_system,
+                MemoryTask.user_id == task.user_id,
+                MemoryTask.session_id == task.session_id,
+                MemoryTask.batch_seq < task.batch_seq,
+                MemoryTask.status.in_(["succeeded", "partial"]),
+                MemoryTaskSource.kind == "target",
+                SourceRecord.status == "active",
+            )
+            .order_by(MemoryTask.batch_seq.desc(), MemoryTaskSource.position.desc())
+            .limit(30)
         )
-        .join(
-            MemoryTask,
-            (MemoryTask.tenant_id == MemoryTaskSource.tenant_id)
-            & (MemoryTask.id == MemoryTaskSource.task_id),
-        )
-        .where(
-            MemoryTask.tenant_id == task.tenant_id,
-            MemoryTask.source_system == task.source_system,
-            MemoryTask.user_id == task.user_id,
-            MemoryTask.session_id == task.session_id,
-            MemoryTask.batch_seq < task.batch_seq,
-            MemoryTask.status.in_(["succeeded", "partial"]),
-            MemoryTaskSource.kind == "target",
-            SourceRecord.status == "active",
-        )
-        .order_by(MemoryTask.batch_seq.desc(), MemoryTaskSource.position.desc())
-        .limit(30)
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     previous_history = [_source_message(source) for source in reversed(previous_rows)]
     seen = {message.get("message_id") for message in previous_history}
     history = [*previous_history]
-    history.extend(
-        message for message in explicit_history if message.get("message_id") not in seen
-    )
+    history.extend(message for message in explicit_history if message.get("message_id") not in seen)
     return TaskInput(
         task_id=task.id,
         tenant_id=task.tenant_id,
@@ -179,6 +251,33 @@ def _load_task_input(session: Session, task: MemoryTask) -> TaskInput:
         targets=targets,
         history=history,
         source_ids=source_ids,
+        task_signature=json.dumps(
+            {
+                "type": task.task_type,
+                "target_type": task.target_type,
+                "target_id": task.target_id,
+                "input_version": task.input_version,
+                "payload": {k: v for k, v in task.payload.items() if k != "execution"},
+            },
+            sort_keys=True,
+        ),
+        source_states={
+            source.id: {
+                "status": source.status,
+                "version": source.version,
+                "message": _source_message(source),
+            }
+            for source in [*(source for _, source in associations), *previous_rows]
+        },
+        associations=tuple(
+            (
+                association.source_id,
+                association.kind,
+                association.position,
+                association.source_version,
+            )
+            for association, _ in associations
+        ),
     )
 
 
@@ -188,6 +287,7 @@ def _similar_candidates(
     task_input: TaskInput,
     model_id: str,
     embedding: list[float],
+    fact: ExtractedFact,
     limit: int = 5,
 ) -> list[tuple[MemoryItem, float]]:
     distance = MemoryEmbedding.embedding.cosine_distance(embedding).label("distance")
@@ -209,7 +309,8 @@ def _similar_candidates(
             MemoryItem.subject_type == "user",
             MemoryItem.subject_id == task_input.user_id,
             MemoryItem.cognitive_type == "fact",
-            MemoryItem.status == "active",
+            MemoryItem.status.in_(["active", "disputed"]),
+            *_scope_filters(fact),
             or_(MemoryItem.expired_at.is_(None), MemoryItem.expired_at > datetime.now(UTC)),
             MemoryEmbedding.model_id == model_id,
             MemoryEmbedding.status == "active",
@@ -241,10 +342,218 @@ def _add_evidence(
                 upstream_source_id=source_id,
                 downstream_memory_id=memory_id,
                 upstream_version=source.version,
-                evidence_snippet=source.raw_content,
-                evidence_locator={"message_id": message_id},
+                evidence_snippet=next(
+                    m["content"] for m in task_input.targets if m["message_id"] == message_id
+                ),
+                evidence_locator={
+                    "message_id": message_id,
+                    **{
+                        k: m[k]
+                        for m in task_input.targets
+                        if m["message_id"] == message_id
+                        for k in ("start_char", "end_char")
+                        if k in m
+                    },
+                },
             )
         )
+
+    task = session.get(MemoryTask, task_input.task_id)
+    session.add(
+        MemoryAuditLog(
+            tenant_id=task_input.tenant_id,
+            action="UPDATE",
+            target_type="memory",
+            target_id=memory_id,
+            operator_type="agent",
+            operator_id=task_input.caller_agent_id,
+            reason_code="FACT_EVIDENCE_ADDED",
+            correlation_id=task.correlation_id,
+            state_after={
+                "evidence_group_id": group_id,
+                "task_id": task_input.task_id,
+                "message_ids": fact.message_ids,
+            },
+        )
+    )
+
+
+def _scope_filters(fact: ExtractedFact):
+    return (
+        MemoryItem.business_domains.is_(None)
+        if fact.business_domains is None
+        else MemoryItem.business_domains.is_not(None),
+        MemoryItem.project_domains.is_(None),
+        MemoryItem.metadata_json["project_context"].as_string().is_(None)
+        if fact.project_context is None
+        else MemoryItem.metadata_json["project_context"].as_string() == fact.project_context,
+    )
+
+
+def _compatible_business(fact: ExtractedFact, candidate: dict[str, Any]) -> bool:
+    labels = candidate.get("business_domains")
+    if (fact.business_domains is None) != (labels is None):
+        return False
+    initial = {"communication", "email", "disk"}
+    # Unknown/new tags need semantic comparison; known distinct initial scopes do not.
+    return not (
+        fact.business_domains and labels
+        and set(fact.business_domains).issubset(initial)
+        and set(labels).issubset(initial)
+        and set(fact.business_domains) != set(labels)
+    )
+
+
+def _scope_memories(session: Session, task_input: TaskInput, fact: ExtractedFact):
+    return session.scalars(
+        select(MemoryItem)
+        .where(
+            MemoryItem.tenant_id == task_input.tenant_id,
+            MemoryItem.subject_type == "user",
+            MemoryItem.subject_id == task_input.user_id,
+            MemoryItem.cognitive_type == "fact",
+            MemoryItem.status.in_(["active", "disputed"]),
+            *_scope_filters(fact),
+            or_(MemoryItem.expired_at.is_(None), MemoryItem.expired_at > datetime.now(UTC)),
+        )
+        .order_by(MemoryItem.id)
+    ).all()
+
+
+def _fingerprint(memories: list[MemoryItem]) -> str:
+    values = [
+        {
+            "id": m.id,
+            "version": m.version,
+            "content": m.content,
+            "summary": m.summary,
+            "status": m.status,
+            "metadata": m.metadata_json,
+            "group": m.conflict_group_id,
+            "effective_at": m.effective_at.isoformat(),
+            "expired_at": m.expired_at.isoformat() if m.expired_at else None,
+        }
+        for m in memories
+    ]
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def _fact_time(fact: ExtractedFact, task_input: TaskInput) -> datetime:
+    return fact.effective_at or max(
+        datetime.fromisoformat(m["occurred_at"])
+        for m in task_input.targets
+        if m["message_id"] in fact.message_ids
+    )
+
+
+def _check_governance(
+    decision: GovernanceDecision,
+    fact: ExtractedFact,
+    candidates: list[dict[str, Any]],
+    task_input: TaskInput,
+) -> None:
+    by_id = {m["id"]: m for m in candidates}
+    references = set(decision.memory_ids)
+    if decision.historical_before_id:
+        references.add(decision.historical_before_id)
+    if not references.issubset(by_id):
+        raise ProviderError("governance output cites an unknown memory ID")
+    if decision.historical_before_id:
+        boundary = by_id[decision.historical_before_id]
+        source_time = max(
+            datetime.fromisoformat(m["occurred_at"])
+            for m in task_input.targets
+            if m["message_id"] in fact.message_ids and m["role"] == "user"
+        )
+        newer_source = datetime.fromisoformat(
+            boundary.get("source_occurred_at") or boundary["effective_at"]
+        )
+        if source_time >= newer_source:
+            raise ProviderError("historical boundary cannot downgrade a newer assertion")
+        if (
+            fact.temporal_kind != "current"
+            or boundary["temporal_kind"] != "current"
+            or _fact_time(fact, task_input) >= datetime.fromisoformat(boundary["effective_at"])
+        ):
+            raise ProviderError(
+                "historical boundary must follow the incoming current-state assertion"
+            )
+    selected = [by_id[mid] for mid in decision.memory_ids]
+    for candidate in [by_id[mid] for mid in references]:
+        if "business_domains" in candidate and not _compatible_business(fact, candidate):
+            raise ProviderError("governance cannot cross business applicability")
+        if candidate.get("project_context") != fact.project_context:
+            raise ProviderError("governance cannot cross project context")
+    if decision.action == "DUPLICATE":
+        candidate = selected[0]
+        if candidate["status"] != "active":
+            raise ProviderError("disputed memory cannot be a duplicate")
+        if candidate.get("temporal_kind", "current") != fact.temporal_kind or candidate[
+            "expired_at"
+        ] != (fact.expired_at.isoformat() if fact.expired_at else None):
+            raise ProviderError("duplicate has different temporal applicability")
+    if decision.action == "SUPERSEDE":
+        if fact.change_kind == "none" or fact.temporal_kind == "historical":
+            raise ProviderError("supersession requires an explicit current-state change")
+        cited = next(
+            (
+                m
+                for m in task_input.targets
+                if m["message_id"] == decision.justification_message_id
+                and m["role"] == "user"
+                and m["message_id"] in fact.message_ids
+            ),
+            None,
+        )
+        if (
+            cited is None
+            or not decision.justification_quote
+            or decision.justification_quote not in cited["content"]
+        ):
+            raise ProviderError("supersession requires a verbatim target user justification")
+        incoming = datetime.fromisoformat(cited["occurred_at"])
+        for candidate in selected:
+            if candidate.get("temporal_kind", "current") == "historical":
+                raise ProviderError("supersession cannot erase a historical interval")
+            source_time = candidate.get("source_occurred_at") or candidate["effective_at"]
+            if incoming < datetime.fromisoformat(source_time):
+                raise ProviderError("late input cannot supersede a newer fact")
+            if fact.change_kind == "update" and _fact_time(
+                fact, task_input
+            ) < datetime.fromisoformat(candidate["effective_at"]):
+                raise ProviderError("state update cannot move backwards in time")
+            if candidate["status"] == "disputed" and fact.change_kind != "clarification":
+                raise ProviderError("dispute recovery requires explicit user clarification")
+    if decision.action == "DISPUTE":
+        for candidate in selected:
+            start = datetime.fromisoformat(candidate["effective_at"])
+            end = (
+                datetime.fromisoformat(candidate["expired_at"]) if candidate["expired_at"] else None
+            )
+            if (fact.expired_at is not None and fact.expired_at <= start) or (
+                end is not None and end <= _fact_time(fact, task_input)
+            ):
+                raise ProviderError("non-overlapping historical periods cannot be disputed")
+    if decision.action in {"SUPERSEDE", "DISPUTE"}:
+        groups = {m["conflict_group_id"] for m in selected if m["conflict_group_id"]}
+        group_ids = {m["id"] for m in candidates if m["conflict_group_id"] in groups}
+        if not group_ids.issubset(decision.memory_ids):
+            raise ProviderError("governance must include every member of a selected conflict group")
+
+
+def _candidate(memory: MemoryItem) -> dict[str, Any]:
+    return {
+        "id": memory.id,
+        "memory": memory.content,
+        "business_domains": memory.business_domains,
+        "project_context": (memory.metadata_json or {}).get("project_context"),
+        "status": memory.status,
+        "effective_at": memory.effective_at.isoformat(),
+        "expired_at": memory.expired_at.isoformat() if memory.expired_at else None,
+        "conflict_group_id": memory.conflict_group_id,
+        "temporal_kind": (memory.metadata_json or {}).get("temporal_kind", "current"),
+        "source_occurred_at": (memory.metadata_json or {}).get("source_occurred_at"),
+    }
 
 
 def _plan_decisions(
@@ -256,43 +565,128 @@ def _plan_decisions(
     fact_model: FactModel,
     embedder: Embedder,
     duplicate_threshold: float,
+    consume_call,
+    budget: ExtractionBudget,
 ) -> list[FactDecision]:
-    decisions: list[FactDecision] = []
+    decisions = []
+    working = {}
+    fingerprints = {}
     for fact, embedding in zip(facts, embeddings, strict=True):
+        scope = (fact.business_domains is not None, fact.project_context)
         with session_factory() as session:
-            duplicate_id = session.scalars(
-                select(MemoryItem.id).where(
-                    MemoryItem.tenant_id == task_input.tenant_id,
-                    MemoryItem.subject_type == "user",
-                    MemoryItem.subject_id == task_input.user_id,
-                    MemoryItem.cognitive_type == "fact",
-                    MemoryItem.status == "active",
-                    MemoryItem.semantic_hash == _fact_hash(fact.memory),
-                )
-            ).first()
-            candidates = (
-                []
-                if duplicate_id is not None
-                else _similar_candidates(
+            if scope not in working:
+                memories = _scope_memories(session, task_input, fact)
+                fingerprints[scope] = _fingerprint(memories)
+                working[scope] = [
+                    _candidate(m) for m in sorted(memories, key=lambda m: m.updated_at)
+                ]
+            available = working[scope]
+            eligible = [m for m in available if _compatible_business(fact, m)]
+            exact = next(
+                (
+                    m
+                    for m in eligible
+                    if m.get("business_domains") == fact.business_domains
+                    and m["status"] == "active"
+                    and _fact_hash(m["memory"]) == _fact_hash(fact.memory)
+                    and m["temporal_kind"] == fact.temporal_kind
+                    and m["expired_at"]
+                    == (fact.expired_at.isoformat() if fact.expired_at else None)
+                    and (
+                        fact.temporal_kind != "historical"
+                        or m["effective_at"] == _fact_time(fact, task_input).isoformat()
+                    )
+                ),
+                None,
+            )
+            if exact is not None:
+                decision = GovernanceDecision(action="DUPLICATE", memory_ids=[exact["id"]])
+            else:
+                similar = _similar_candidates(
                     session,
                     task_input=task_input,
                     model_id=embedder.model_id,
                     embedding=embedding,
+                    fact=fact,
                 )
+                routed_ids = {m.id for m, score in similar if score >= duplicate_threshold}
+                selected = {
+                    m["id"]: m for m in eligible if m["id"] in routed_ids or m in eligible[-10:]
+                }
+                groups = {
+                    m["conflict_group_id"] for m in selected.values() if m["conflict_group_id"]
+                }
+                selected.update({m["id"]: m for m in available if m["conflict_group_id"] in groups})
+                candidates = list(selected.values())
+                decision = None
+        if decision is None:
+            if candidates:
+                payload = {
+                    "fact": fact.model_dump(mode="json"),
+                    "candidates": candidates,
+                    "targets": task_input.targets,
+                }
+                if (
+                    input_size(GOVERNANCE_PROMPT, payload)
+                    > budget.input_tokens - budget.output_tokens
+                ):
+                    raise WorkerInputError("governance input exceeds model budget")
+                consume_call()
+                decision = fact_model.resolve(
+                    fact=fact, candidates=candidates, targets=task_input.targets
+                )
+                _check_governance(decision, fact, candidates, task_input)
+            else:
+                decision = GovernanceDecision(action="ADD")
+        if decision.historical_before_id:
+            boundary = next(m for m in candidates if m["id"] == decision.historical_before_id)
+            start_time = _fact_time(fact, task_input)
+            fact = fact.model_copy(
+                update={
+                    "memory": f"在 {start_time.isoformat()} 时：{fact.memory}",
+                    "temporal_kind": "historical",
+                    "effective_at": start_time,
+                    "expired_at": datetime.fromisoformat(boundary["effective_at"]),
+                }
             )
-            routed = [
-                {"id": memory.id, "memory": memory.content, "similarity": round(score, 6)}
-                for memory, score in candidates
-                if score >= duplicate_threshold
-            ]
-        if duplicate_id is None and routed:
-            duplicate_id = fact_model.find_duplicate(fact=fact.memory, candidates=routed)
+        memory_id = f"mem_{uuid4().hex}"
+        group = None
+        if decision.action == "DISPUTE":
+            group = next(
+                (
+                    m["conflict_group_id"]
+                    for m in available
+                    if m["id"] in decision.memory_ids and m["conflict_group_id"]
+                ),
+                f"cfg_{uuid4().hex}",
+            )
+        if decision.action != "DUPLICATE":
+            if decision.action == "SUPERSEDE":
+                available[:] = [m for m in available if m["id"] not in decision.memory_ids]
+            elif decision.action == "DISPUTE":
+                for m in available:
+                    if m["id"] in decision.memory_ids:
+                        m.update(status="disputed", conflict_group_id=group)
+            new_candidate = {
+                "id": memory_id,
+                "memory": fact.memory,
+                "business_domains": fact.business_domains,
+                "project_context": fact.project_context,
+                "status": "disputed" if group else "active",
+                "effective_at": _fact_time(fact, task_input).isoformat(),
+                "expired_at": fact.expired_at.isoformat() if fact.expired_at else None,
+                "conflict_group_id": group,
+                "temporal_kind": fact.temporal_kind,
+                "source_occurred_at": max(
+                    datetime.fromisoformat(m["occurred_at"])
+                    for m in task_input.targets
+                    if m["message_id"] in fact.message_ids
+                ).isoformat(),
+            }
+            if fact.expired_at is None or fact.expired_at > datetime.now(UTC):
+                available.append(new_candidate)
         decisions.append(
-            FactDecision(
-                fact=fact,
-                embedding=embedding,
-                duplicate_memory_id=duplicate_id,
-            )
+            FactDecision(fact, embedding, decision, fingerprints[scope], memory_id, group)
         )
     return decisions
 
@@ -305,82 +699,98 @@ def _commit_results(
     decisions: list[FactDecision],
     embedder: Embedder,
 ) -> list[dict[str, str]]:
-    results: list[dict[str, str]] = []
-    for decision in decisions:
-        fact = decision.fact
-        embedding = decision.embedding
-        semantic_hash = _fact_hash(fact.memory)
-        session.execute(
-            select(func.pg_advisory_xact_lock(func.hashtextextended(semantic_hash, 0)))
+    results = []
+    session.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                func.hashtextextended(f"fact:{task_input.tenant_id}:{task_input.user_id}", 0)
+            )
         )
-        duplicate = None
-        if decision.duplicate_memory_id is not None:
-            duplicate = session.scalars(
-                select(MemoryItem).where(
-                    MemoryItem.tenant_id == task_input.tenant_id,
-                    MemoryItem.id == decision.duplicate_memory_id,
-                    MemoryItem.status == "active",
-                )
-            ).one_or_none()
-        if duplicate is None:
-            duplicate = session.scalars(
-                select(MemoryItem).where(
-                    MemoryItem.tenant_id == task_input.tenant_id,
-                    MemoryItem.subject_type == "user",
-                    MemoryItem.subject_id == task_input.user_id,
-                    MemoryItem.cognitive_type == "fact",
-                    MemoryItem.status == "active",
-                    MemoryItem.semantic_hash == semantic_hash,
-                )
-            ).first()
-
-        if duplicate is not None:
+    )
+    # Check all scope snapshots before this slice mutates any memory.
+    for decision in decisions:
+        memories = _scope_memories(session, task_input, decision.fact)
+        session.scalars(
+            select(MemoryItem)
+            .where(MemoryItem.id.in_([m.id for m in memories]))
+            .order_by(MemoryItem.id)
+            .with_for_update()
+        ).all()
+        for memory in memories:
+            session.refresh(memory)
+        if _fingerprint(memories) != decision.scope_fingerprint:
+            raise ProviderError("governance candidates changed; slice must be retried")
+    for decision in decisions:
+        fact, governance = decision.fact, decision.governance
+        if governance.action == "DUPLICATE":
             _add_evidence(
-                session,
-                task_input=task_input,
-                fact=fact,
-                memory_id=duplicate.id,
+                session, task_input=task_input, fact=fact, memory_id=governance.memory_ids[0]
             )
             continue
-
-        memory_id = f"mem_{uuid4().hex}"
-        summary = fact.memory[:512]
+        existing = [session.get(MemoryItem, mid) for mid in governance.memory_ids]
+        conflict_group = decision.conflict_group_id
+        for old in existing:
+            govern_memory(
+                session,
+                memory=old,
+                status="disputed" if governance.action == "DISPUTE" else "invalidated",
+                reason_code="FACT_DISPUTED"
+                if governance.action == "DISPUTE"
+                else "FACT_SUPERSEDED",
+                correlation_id=task.correlation_id,
+                conflict_group_id=conflict_group,
+            )
         memory = MemoryItem(
-            id=memory_id,
+            id=decision.memory_id,
             tenant_id=task_input.tenant_id,
             subject_type="user",
             subject_id=task_input.user_id,
             cognitive_type="fact",
-            summary=summary,
+            business_domains=fact.business_domains,
+            project_domains=None,
+            summary=fact.memory[:512],
             content=fact.memory,
-            semantic_hash=semantic_hash,
+            semantic_hash=_fact_hash(fact.memory),
             confidence=1,
-            effective_at=max(
-                source.occurred_at
-                for source in session.scalars(
-                    select(SourceRecord).where(
-                        SourceRecord.id.in_(
-                            [task_input.source_ids[message_id] for message_id in fact.message_ids]
-                        )
-                    )
-                )
-            ),
+            effective_at=_fact_time(fact, task_input),
+            expired_at=fact.expired_at,
+            status="disputed"
+            if conflict_group
+            else "expired"
+            if fact.expired_at is not None and fact.expired_at <= datetime.now(UTC)
+            else "active",
+            conflict_group_id=conflict_group,
+            supersedes_id=existing[0].id if governance.action == "SUPERSEDE" else None,
+            metadata_json={
+                "project_limited": fact.project_limited,
+                "project_context": fact.project_context,
+                "temporal_kind": fact.temporal_kind,
+                "source_occurred_at": max(
+                    datetime.fromisoformat(m["occurred_at"])
+                    for m in task_input.targets
+                    if m["message_id"] in fact.message_ids
+                ).isoformat(),
+                "governance_action": governance.action,
+                "previous_memory_ids": governance.memory_ids,
+            },
             created_by=task_input.caller_agent_id,
         )
         session.add(memory)
         session.flush()
-        _add_evidence(
-            session, task_input=task_input, fact=fact, memory_id=memory.id
-        )
-        session.add(
-            MemoryEmbedding(
-                tenant_id=task_input.tenant_id,
-                memory_id=memory.id,
-                model_id=embedder.model_id,
-                content_hash=_memory_content_hash(summary, fact.memory),
-                embedding=embedding,
+        _add_evidence(session, task_input=task_input, fact=fact, memory_id=memory.id)
+        if memory.status == "active" and (
+            memory.expired_at is None or memory.expired_at > datetime.now(UTC)
+        ):
+            session.add(
+                MemoryEmbedding(
+                    tenant_id=task_input.tenant_id,
+                    memory_id=memory.id,
+                    model_id=embedder.model_id,
+                    content_hash=_memory_content_hash(memory.summary, memory.content),
+                    embedding=decision.embedding,
+                )
             )
-        )
+            results.append({"id": memory.id, "memory": fact.memory, "event": "ADD"})
         session.add(
             MemoryAuditLog(
                 tenant_id=task_input.tenant_id,
@@ -391,32 +801,123 @@ def _commit_results(
                 operator_id=task_input.caller_agent_id,
                 reason_code="FACT_EXTRACTED",
                 correlation_id=task.correlation_id,
-                state_after={"content": fact.memory, "status": "active"},
+                state_after={
+                    "content": fact.memory,
+                    "status": memory.status,
+                    "governance_action": governance.action,
+                },
             )
         )
-        results.append({"id": memory.id, "memory": fact.memory, "event": "ADD"})
+    return [
+        result for result in results if session.get(MemoryItem, result["id"]).status == "active"
+    ]
 
-    source_ids = list(task_input.source_ids.values())
-    sources = session.scalars(
-        select(SourceRecord).where(
-            SourceRecord.tenant_id == task_input.tenant_id,
-            SourceRecord.id.in_(source_ids),
+
+def _leased_task(session, *, tenant_id, task_id, worker_id, lease_token):
+    task = session.scalars(
+        select(MemoryTask)
+        .where(
+            MemoryTask.id == task_id,
+            MemoryTask.tenant_id == tenant_id,
+            MemoryTask.status == "processing",
+            MemoryTask.worker_id == worker_id,
+            MemoryTask.lease_token == lease_token,
+            MemoryTask.locked_until > func.clock_timestamp(),
         )
+        .with_for_update()
+    ).one_or_none()
+    if task is None:
+        raise LeaseLostError("task lease was lost")
+    return task
+
+
+def _save_execution(task: MemoryTask, execution: dict[str, Any]) -> None:
+    task.payload = {**task.payload, "execution": execution}
+
+
+def _restore_input(value: dict[str, Any]) -> TaskInput:
+    return TaskInput(
+        **{**value, "associations": tuple(tuple(row) for row in value["associations"])}
+    )
+
+
+def _validate_input(
+    session: Session,
+    task: MemoryTask,
+    task_input: TaskInput,
+    *,
+    committed_changes: bool = False,
+) -> None:
+    identity = (
+        task.id,
+        task.tenant_id,
+        task.caller_agent_id,
+        task.user_id,
+        task.source_system,
+        task.session_id,
+        task.batch_seq,
+    )
+    expected = (
+        task_input.task_id,
+        task_input.tenant_id,
+        task_input.caller_agent_id,
+        task_input.user_id,
+        task_input.source_system,
+        task_input.session_id,
+        task_input.batch_seq,
+    )
+    signature = json.dumps(
+        {
+            "type": task.task_type,
+            "target_type": task.target_type,
+            "target_id": task.target_id,
+            "input_version": task.input_version,
+            "payload": {k: v for k, v in task.payload.items() if k != "execution"},
+        },
+        sort_keys=True,
+    )
+    associations = session.scalars(
+        select(MemoryTaskSource)
+        .where(
+            MemoryTaskSource.task_id == task.id,
+            MemoryTaskSource.tenant_id == task.tenant_id,
+        )
+        .order_by(MemoryTaskSource.kind, MemoryTaskSource.position)
+        .with_for_update()
     ).all()
-    for source in sources:
-        source.processed_version = source.version
-    for association in session.scalars(
-        select(MemoryTaskSource).where(
-            MemoryTaskSource.tenant_id == task_input.tenant_id,
-            MemoryTaskSource.task_id == task_input.task_id,
-            MemoryTaskSource.kind == "target",
+    actual_associations = tuple(
+        (a.source_id, a.kind, a.position, a.source_version) for a in associations
+    )
+    sources = session.scalars(
+        select(SourceRecord)
+        .where(
+            SourceRecord.tenant_id == task.tenant_id,
+            SourceRecord.id.in_(task_input.source_states),
         )
+        .order_by(SourceRecord.id)
+        .with_for_update()
+    ).all()
+    states = {
+        source.id: {
+            "status": source.status,
+            "version": source.version,
+            "message": _source_message(source),
+        }
+        for source in sources
+    }
+    if (
+        identity != expected
+        or signature != task_input.task_signature
+        or actual_associations != task_input.associations
+        or states != task_input.source_states
     ):
-        association.status = "processed"
-    return results
+        raise WorkerInputError(
+            "task input changed or source became unavailable during extraction",
+            committed_changes=committed_changes,
+        )
 
 
-def process_task(
+def _process_task(
     session_factory: sessionmaker[Session],
     *,
     task_id: str,
@@ -426,11 +927,18 @@ def process_task(
     fact_model: FactModel,
     embedder: Embedder,
     duplicate_threshold: float,
+    budget: ExtractionBudget,
 ) -> None:
+    ownership = {
+        "tenant_id": tenant_id,
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "lease_token": lease_token,
+    }
     with session_factory.begin() as session:
-        task = session.get(MemoryTask, task_id)
-        if task is None or task.tenant_id != tenant_id:
-            raise WorkerInputError("task does not exist")
+        task = _leased_task(session, **ownership)
+        if task.task_type != "fact_extract":
+            raise WorkerInputError("unsupported task type")
         prior_failure = session.scalars(
             select(MemoryTask.id).where(
                 MemoryTask.tenant_id == task.tenant_id,
@@ -444,10 +952,7 @@ def process_task(
         if prior_failure is not None:
             if not finish_task(
                 session,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                worker_id=worker_id,
-                lease_token=lease_token,
+                **ownership,
                 status="failed",
                 results=[],
                 error={
@@ -457,45 +962,218 @@ def process_task(
             ):
                 raise LeaseLostError("task lease was lost")
             return
-        task_input = _load_task_input(session, task)
+        execution = task.payload.get("execution")
+        if execution is None:
+            task_input = _load_task_input(session, task)
+            try:
+                slices = build_slices(
+                    task_input.targets, task_input.history, system=EXTRACTION_PROMPT, budget=budget
+                )
+            except ValueError as exc:
+                raise WorkerInputError(str(exc)) from exc
+            execution = {
+                "input": asdict(task_input),
+                "slices": slices,
+                "next_slice": 0,
+                "model_calls": 0,
+                "changed": False,
+                "diagnostics": [],
+                "budget": asdict(budget),
+                "prompt_version": PROMPT_VERSION,
+            }
+            _save_execution(task, execution)
+            task.result_json = []
+        else:
+            if execution["prompt_version"] != PROMPT_VERSION:
+                raise WorkerInputError("task prompt version is no longer supported")
+            task_input = _restore_input(execution["input"])
+            budget = ExtractionBudget(**execution["budget"])
+        _validate_input(session, task, task_input, committed_changes=execution["changed"])
 
-    if not task_input.targets:
-        facts: list[ExtractedFact] = []
-        embeddings: list[list[float]] = []
-    else:
-        facts = fact_model.extract(targets=task_input.targets, history=task_input.history)
-        embeddings = embedder.embed([fact.memory for fact in facts])
-    decisions = _plan_decisions(
-        session_factory,
-        task_input=task_input,
-        facts=facts,
-        embeddings=embeddings,
-        fact_model=fact_model,
-        embedder=embedder,
-        duplicate_threshold=duplicate_threshold,
-    )
+    def consume_call():
+        with session_factory.begin() as session:
+            task = _leased_task(session, **ownership)
+            if "execution" not in task.payload:
+                raise WorkerInputError(
+                    "task execution input was removed", committed_changes=execution["changed"]
+                )
+            _validate_input(session, task, task_input, committed_changes=execution["changed"])
+            state = dict(task.payload["execution"])
+            if state["model_calls"] >= budget.max_model_calls:
+                raise ModelCallBudgetError("task model call budget exhausted")
+            state["model_calls"] += 1
+            _save_execution(task, state)
+            execution["model_calls"] = state["model_calls"]
 
-    with session_factory.begin() as session:
-        task = session.get(MemoryTask, task_id)
-        if task is None:
-            raise WorkerInputError("task disappeared")
-        results = _commit_results(
-            session,
-            task=task,
-            task_input=task_input,
-            decisions=decisions,
+    while execution["next_slice"] < len(execution["slices"]):
+        index = execution["next_slice"]
+        current = execution["slices"][index]
+        slice_input = replace(task_input, targets=current["targets"], history=current["history"])
+        consume_call()
+        try:
+            facts = fact_model.extract(targets=slice_input.targets, history=slice_input.history)
+        except OutputLimitError as exc:
+            try:
+                children = split_slice(current)
+            except ValueError:
+                raise ProviderError("output truncation recovery exhausted") from exc
+            # Retain the frozen input and trim history again after splitting.
+            for child in children:
+                while (
+                    input_size(
+                        EXTRACTION_PROMPT,
+                        {
+                            "targets": child["targets"],
+                            "history": child["history"],
+                        },
+                    )
+                    > budget.input_tokens - budget.output_tokens
+                ):
+                    child["history"] = child["history"][1:]
+            with session_factory.begin() as session:
+                task = _leased_task(session, **ownership)
+                execution["slices"] = [
+                    *execution["slices"][:index],
+                    *children,
+                    *execution["slices"][index + 1 :],
+                ]
+                execution["diagnostics"] = [
+                    *execution["diagnostics"],
+                    {
+                        "code": "OUTPUT_LIMIT_REACHED",
+                        "slice_id": index,
+                        "action_taken": "split",
+                        "attempt": execution["model_calls"],
+                    },
+                ]
+                _save_execution(task, execution)
+            continue
+        validate_fact_evidence(facts, slice_input.targets)
+        accepted = []
+        skipped = []
+        for fact in facts:
+            reason = candidate_skip_reason(fact)
+            if reason:
+                skipped.append(
+                    {
+                        "code": reason,
+                        "slice_id": index,
+                        "message_ids": fact.message_ids,
+                        "action_taken": "skipped",
+                    }
+                )
+            else:
+                accepted.append(fact)
+        embeddings = []
+        for start in range(0, len(accepted), 32):
+            consume_call()
+            embeddings.extend(embedder.embed([f.memory for f in accepted[start : start + 32]]))
+        decisions = _plan_decisions(
+            session_factory,
+            task_input=slice_input,
+            facts=accepted,
+            embeddings=embeddings,
+            fact_model=fact_model,
             embedder=embedder,
+            duplicate_threshold=duplicate_threshold,
+            consume_call=consume_call,
+            budget=budget,
         )
-        if not finish_task(
-            session,
-            tenant_id=tenant_id,
+        with session_factory.begin() as session:
+            task = _leased_task(session, **ownership)
+            _validate_input(session, task, task_input, committed_changes=execution["changed"])
+            if task.payload["execution"]["next_slice"] != index:
+                raise LeaseLostError("slice progress changed")
+            results = _commit_results(
+                session, task=task, task_input=slice_input, decisions=decisions, embedder=embedder
+            )
+            execution["next_slice"] = index + 1
+            execution["changed"] = execution["changed"] or bool(decisions)
+            execution["diagnostics"] = [*execution["diagnostics"], *skipped]
+            for diagnostic in skipped:
+                session.add(
+                    MemoryAuditLog(
+                        tenant_id=tenant_id,
+                        action="UPDATE",
+                        target_type="source",
+                        target_id=task_input.source_ids[diagnostic["message_ids"][0]],
+                        operator_type="system",
+                        operator_id="memory_cmic",
+                        reason_code=diagnostic["code"],
+                        correlation_id=task.correlation_id,
+                        state_after=diagnostic,
+                    )
+                )
+            _save_execution(task, execution)
+            task.result_json = [
+                result
+                for result in [*(task.result_json or []), *results]
+                if session.get(MemoryItem, result["id"]).status == "active"
+            ]
+            remaining = {
+                m["message_id"]
+                for pending in execution["slices"][index + 1 :]
+                for m in pending["targets"]
+            }
+            for message in current["targets"]:
+                if message["message_id"] not in remaining:
+                    source = session.get(SourceRecord, task_input.source_ids[message["message_id"]])
+                    source.processed_version = source.version
+                    association = session.get(MemoryTaskSource, (tenant_id, task_id, source.id))
+                    association.status = "processed"
+            # Fence every slice, including non-terminal commits, against expired leases.
+            if not session.scalar(
+                select(MemoryTask.id).where(
+                    MemoryTask.id == task_id,
+                    MemoryTask.locked_until > func.clock_timestamp(),
+                )
+            ):
+                raise LeaseLostError("task lease expired during slice commit")
+            if index + 1 == len(execution["slices"]):
+                if not finish_task(
+                    session, **ownership, status="succeeded", results=task.result_json
+                ):
+                    raise LeaseLostError("task lease was lost")
+    if not execution["slices"]:
+        with session_factory.begin() as session:
+            task = _leased_task(session, **ownership)
+            _validate_input(session, task, task_input, committed_changes=execution["changed"])
+            if not finish_task(session, **ownership, status="succeeded", results=[]):
+                raise LeaseLostError("task lease was lost")
+
+
+def process_task(
+    session_factory: sessionmaker[Session],
+    *,
+    task_id: str,
+    tenant_id: str,
+    worker_id: str,
+    lease_token: str,
+    fact_model: FactModel,
+    embedder: Embedder,
+    duplicate_threshold: float,
+    lease_seconds: int = 180,
+    budget: ExtractionBudget = ExtractionBudget(),
+) -> None:
+    with _lease_heartbeat(
+        session_factory,
+        tenant_id=tenant_id,
+        task_id=task_id,
+        worker_id=worker_id,
+        lease_token=lease_token,
+        lease_seconds=lease_seconds,
+    ):
+        _process_task(
+            session_factory,
             task_id=task_id,
+            tenant_id=tenant_id,
             worker_id=worker_id,
             lease_token=lease_token,
-            status="succeeded",
-            results=results,
-        ):
-            raise LeaseLostError("task lease was lost")
+            fact_model=fact_model,
+            embedder=embedder,
+            duplicate_threshold=duplicate_threshold,
+            budget=budget,
+        )
 
 
 def run_once(
@@ -505,6 +1183,7 @@ def run_once(
     fact_model: FactModel,
     embedder: Embedder,
     duplicate_threshold: float,
+    budget: ExtractionBudget = ExtractionBudget(),
 ) -> bool:
     with session_factory() as session:
         tenant_ids = session.scalars(
@@ -528,6 +1207,7 @@ def run_once(
                 worker_id=worker_id,
                 limit=1,
                 lease_seconds=180,
+                task_types=("fact_extract",),
             )
             task = claimed[0] if claimed else None
             if task is not None:
@@ -545,18 +1225,28 @@ def run_once(
                 fact_model=fact_model,
                 embedder=embedder,
                 duplicate_threshold=duplicate_threshold,
+                budget=budget,
             )
         except WorkerInputError as exc:
             with session_factory.begin() as session:
+                task = session.get(MemoryTask, task_id)
+                changed = exc.committed_changes or (task.payload.get("execution") or {}).get(
+                    "changed", False
+                )
                 finish_task(
                     session,
                     tenant_id=tenant_id,
                     task_id=task_id,
                     worker_id=worker_id,
                     lease_token=lease_token,
-                    status="failed",
-                    results=[],
-                    error={"code": "INPUT_PROCESSING_FAILED", "message": str(exc)},
+                    status="partial" if changed else "failed",
+                    results=task.result_json or [],
+                    error={
+                        "code": "EXTRACTION_FAILED"
+                        if isinstance(exc, ModelCallBudgetError)
+                        else "INPUT_PROCESSING_FAILED",
+                        "message": str(exc),
+                    },
                 )
         except ProviderError as exc:
             with session_factory.begin() as session:
@@ -600,6 +1290,7 @@ def main() -> None:
         api_key=settings.dashscope_api_key,
         base_url=settings.dashscope_base_url,
         model=settings.dashscope_model,
+        output_tokens=settings.extraction_budget.output_tokens,
     )
     embedder = SiliconFlowEmbedder(
         api_key=settings.siliconflow_api_key,
@@ -622,6 +1313,7 @@ def main() -> None:
             fact_model=fact_model,
             embedder=embedder,
             duplicate_threshold=settings.duplicate_candidate_threshold,
+            budget=settings.extraction_budget,
         )
         if not handled:
             time.sleep(1)

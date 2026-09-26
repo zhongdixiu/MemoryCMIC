@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 
 from memory_cmic.auth import StaticCredentialStore
+from memory_cmic.extraction_input import ExtractionBudget
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class Settings:
     siliconflow_base_url: str
     siliconflow_embedding_model: str
     duplicate_candidate_threshold: float
+    extraction_budget: ExtractionBudget = ExtractionBudget()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -45,4 +47,9 @@ class Settings:
                 "SILICONFLOW_EMBEDDING_MODEL", "BAAI/bge-m3"
             ),
             duplicate_candidate_threshold=threshold,
+            extraction_budget=ExtractionBudget(
+                input_tokens=int(os.environ.get("MEMORY_MODEL_INPUT_TOKENS", "12000")),
+                output_tokens=int(os.environ.get("MEMORY_MODEL_OUTPUT_TOKENS", "2048")),
+                max_model_calls=int(os.environ.get("MEMORY_TASK_MODEL_CALL_LIMIT", "20")),
+            ),
         )

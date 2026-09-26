@@ -380,6 +380,33 @@ def invalidate_memory(
     return memory
 
 
+def govern_memory(
+    session: Session, *, memory: MemoryItem, status: str, reason_code: str,
+    correlation_id: str | None, conflict_group_id: str | None = None,
+) -> None:
+    if status not in {"invalidated", "disputed"}:
+        raise ValueError("invalid governance status")
+    if memory.status == status and memory.conflict_group_id == conflict_group_id:
+        return
+    now = datetime.now(UTC)
+    before = {"status": memory.status, "version": memory.version,
+              "conflict_group_id": memory.conflict_group_id}
+    memory.status = status
+    memory.version += 1
+    memory.conflict_group_id = conflict_group_id
+    memory.invalidated_at = now if status == "invalidated" else None
+    memory.updated_at = now
+    session.add(MemoryAuditLog(
+        tenant_id=memory.tenant_id, action="INVALIDATE", target_type="memory",
+        target_id=memory.id, operator_type="system", operator_id="memory_cmic",
+        reason_code=reason_code, correlation_id=correlation_id,
+        state_before=before,
+        state_after={"status": status, "version": memory.version,
+                     "conflict_group_id": conflict_group_id},
+    ))
+    _propagate_memory_change(session, memory=memory, correlation_id=correlation_id, now=now)
+
+
 def expire_memory(
     session: Session,
     *,

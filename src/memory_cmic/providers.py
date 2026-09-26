@@ -2,14 +2,145 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol
 
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+class OutputLimitError(ProviderError):
+    pass
+
+
+PROMPT_VERSION = "p02-v6"
+
+EXTRACTION_PROMPT = (
+    "Extract atomic durable facts newly stated or explicitly confirmed by target user messages. "
+    "History is context only and cannot independently produce facts. Cite target message_ids; "
+    "at least one cited message must be user. Never infer user facts from "
+    "assistant/system/tool alone. "
+    "Business labels describe applicable scenarios, not source systems or mentioned topics. "
+    "Use communication for SMS, phone calls and instant messaging (excluding email); "
+    "email for reading, writing, replying, processing and organizing email; "
+    "disk for personal cloud drive backup, storage, organization and sharing, not local files. "
+    "These are initial canonical labels, NOT an exhaustive enum. For other explicit scenarios "
+    "extract a short, stable semantic label in the user's language, e.g. 方案编写. "
+    "Reuse canonical labels for their synonyms. Split independent applicability requirements. "
+    "Personal identity, birthday and residence are unrestricted unless explicitly limited: "
+    "scope_known=true and business_domains=null. Unknown business applicability uses "
+    "scope_known=false, never null to imply unrestricted. A generic project-proposal preference "
+    "is a known proposal-writing scenario, not an unknown business or a specific project. "
+    "Project-related durable memories MUST be preserved. Project IDs are reserved and not "
+    "assigned. If limited to a particular project set project_limited=true and project_context "
+    "to its explicit name or self-contained identifying context; preserve that condition in "
+    "memory text. Otherwise project_limited=false and project_context=null. "
+    "Unknown or ambiguous project names do not by themselves invalidate a self-contained "
+    "fact. Preserve the supplied project wording without guessing identity. Do not broaden a "
+    "project rule into a general preference. A project material directory does not imply disk. "
+    "scope_known describes business applicability, NOT whether a project ID is resolved. "
+    "Literal names/placeholders such as 未知项目 and 重名项目 are still project_context; "
+    "do not drop them or mark scope_known=false solely because they are unknown/ambiguous. "
+    "For '重名项目的材料放在批准目录', preserve that project condition and use an applicable "
+    "material-management scenario label (not disk unless cloud drive is stated). "
+    "Short standalone requirements such as '项目方案详细说明。' are durable preferences: "
+    "extract with a proposal-writing label, scope_known=true, project_limited=false. "
+    "Use the original language in memory text. "
+    "Preserve temporal meaning in self-contained text. Resolve stated dates relative to "
+    "occurred_at, "
+    "not processing time. Use ISO8601 timestamps with timezone; never fabricate precision. "
+    "temporal_kind=historical requires an effective_at and expired_at interval. "
+    "A year-only historical period uses Jan 1 through Jan 1 of the next year (exclusive). "
+    "If a current move/update is stated only by year or month, set effective_at=null; "
+    "do not invent the exact first day as the event date. "
+    "change_kind is none, correction, update, or clarification; use clarification only "
+    "for explicit "
+    "resolution of contradictory prior statements, update only for an explicit "
+    "current-state change. "
+    "Unresolved references, missing context and no durable value should yield no fact. "
+    "Return JSON {facts:[{memory:string,message_ids:[string],business_domains:[labels]|null,"
+    "scope_known:boolean,project_limited:boolean,project_context:string|null,"
+    "temporal_kind:current|historical,"
+    "change_kind:none|correction|update|clarification,effective_at:timestamp|null,"
+    "expired_at:timestamp|null}]}. Return {facts:[]} when there is no durable fact."
+)
+
+GOVERNANCE_PROMPT = (
+    "Resolve a new user fact against same-subject candidates. First compare applicability: "
+    "business labels are semantic scenario tags; different strings can mean the same scenario. "
+    "Only compare facts with equivalent actual conditions. Different projects, a project-limited "
+    "rule versus a general rule, or genuinely different business scenarios are ADD, never "
+    "DUPLICATE, SUPERSEDE or DISPUTE. Preserve project conditions from memory text and "
+    "project_context even though project IDs are null. "
+    "Return JSON {action:ADD|DUPLICATE|SUPERSEDE|DISPUTE,memory_ids:[string],"
+    "justification_message_id:string|null,justification_quote:string|null,histor"
+    "ical_before_id:string|null}. "
+    "ADD has no IDs. DUPLICATE has exactly one active ID and requires identical durable meaning "
+    "and temporal applicability, not mere similarity. Historical intervals that do not overlap "
+    "are ADD, not conflict or duplicate. SUPERSEDE requires explicit user correction, "
+    "current-state "
+    "update, or clarification, with a verbatim target USER quote and its ID. It replaces an old "
+    "current-state assertion, not unrelated, complementary or historical facts. A "
+    "disputed candidate "
+    "can only be superseded by explicit clarification; include all members of that conflict group. "
+    "Action must match fact.change_kind: none forbids SUPERSEDE. A different birthday with "
+    "change_kind=none is DISPUTE, not an implicit correction or update. "
+    "Never prefer a statement just because it arrived later; compare occurred_at and effective_at. "
+    "For a delayed current-state assertion about the SAME attribute that predates a "
+    "newer candidate, "
+    "use ADD and set historical_before_id to that newer ID. This bounds the delayed assertion "
+    "as history, never as another unbounded current state. Use "
+    "historical_before_id=null otherwise. "
+    "Use DISPUTE for contradictory claims when time or authority cannot resolve them; include "
+    "all affected same-scope candidates. Use only supplied IDs. Disputed candidates must never "
+    "be silently reactivated or selected as duplicates. Default to ADD for compatible "
+    "independent facts."
+)
+
+APPLICABILITY_PROMPT = (
+    "Select memories applicable to the supplied task query and business scenario. "
+    "Business labels are semantic hints, not exhaustive enums or authorization. "
+    "Use memory text and project_context: a project-limited memory only applies when the "
+    "query identifies that same project/context. Never broaden it because project IDs are null. "
+    "Different projects or genuinely different scenarios must be excluded. A relevant "
+    "general user fact can apply across scenarios. Do not select merely because topics overlap. "
+    "Return JSON {memory_ids:[string]} using only supplied candidate IDs."
+)
+
+
+class ApplicabilityOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_ids: list[str]
+
+
+class ApplicabilityModel(Protocol):
+    def select_applicable(
+        self, *, query: str, business_domain: str, candidates: list[dict[str, Any]]
+    ) -> list[str]: ...
+
+
+def normalize_business_domain(label: str) -> str:
+    """Normalize initial label aliases without restricting other semantic scenarios."""
+    label = label.strip().lower()
+    return {
+        "通信": "communication",
+        "通讯": "communication",
+        "sms": "communication",
+        "短信": "communication",
+        "电话": "communication",
+        "即时消息": "communication",
+        "邮件": "email",
+        "电子邮件": "email",
+        "邮件处理": "email",
+        "云盘": "disk",
+        "个人云盘": "disk",
+        "cloud_drive": "disk",
+    }.get(label, label)
 
 
 class ExtractedFact(BaseModel):
@@ -17,6 +148,55 @@ class ExtractedFact(BaseModel):
 
     memory: str = Field(min_length=1, max_length=4096)
     message_ids: list[str] = Field(min_length=1)
+    business_domains: list[str] | None = None
+    scope_known: bool = True
+    project_limited: bool = False
+    project_context: str | None = Field(default=None, min_length=1, max_length=512)
+    temporal_kind: Literal["current", "historical"] = "current"
+    change_kind: Literal["none", "correction", "update", "clarification"] = "none"
+    effective_at: datetime | None = None
+    expired_at: datetime | None = None
+
+    @field_validator("business_domains")
+    @classmethod
+    def normalize_domains(cls, value):
+        if value == []:
+            raise ValueError("business_domains must not be empty")
+        if value is None:
+            return None
+        normalized = [normalize_business_domain(label) for label in value]
+        if any(not label or len(label) > 32 for label in normalized):
+            raise ValueError("business labels must contain 1 to 32 characters")
+        return sorted(set(normalized))
+
+    @field_validator("effective_at", "expired_at")
+    @classmethod
+    def require_timezone(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("fact timestamps must have a timezone")
+        return value.astimezone(UTC) if value is not None else None
+
+    @model_validator(mode="after")
+    def check_interval(self):
+        if self.project_limited != bool(self.project_context and self.project_context.strip()):
+            raise ValueError("project-limited facts require project_context")
+        if self.project_context is not None:
+            self.project_context = self.project_context.strip()
+            if self.project_context not in self.memory:
+                raise ValueError("memory text must preserve project_context")
+        if self.effective_at and self.expired_at and self.expired_at <= self.effective_at:
+            raise ValueError("expired_at must be after effective_at")
+        return self
+
+
+def candidate_skip_reason(fact: ExtractedFact) -> str | None:
+    if not fact.scope_known:
+        return "SCOPE_UNRESOLVED"
+    if fact.temporal_kind == "historical" and (
+        fact.effective_at is None or fact.expired_at is None
+    ):
+        return "TIME_UNRESOLVED"
+    return None
 
 
 class ExtractionOutput(BaseModel):
@@ -25,10 +205,39 @@ class ExtractionOutput(BaseModel):
     facts: list[ExtractedFact]
 
 
-class DuplicateOutput(BaseModel):
+def validate_fact_evidence(facts: list[ExtractedFact], targets: list[dict[str, Any]]) -> None:
+    target_ids = {message["message_id"] for message in targets}
+    user_ids = {message["message_id"] for message in targets if message["role"] == "user"}
+    for fact in facts:
+        cited = set(fact.message_ids)
+        if not cited.issubset(target_ids):
+            raise ProviderError("extraction output cites a non-target message_id")
+        if not cited.intersection(user_ids):
+            raise ProviderError("fact evidence must include a target user message")
+
+
+class GovernanceDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    duplicate_memory_id: str | None
+    action: Literal["ADD", "DUPLICATE", "SUPERSEDE", "DISPUTE"]
+    memory_ids: list[str] = Field(default_factory=list)
+    justification_message_id: str | None = None
+    justification_quote: str | None = None
+    historical_before_id: str | None = None
+
+    @model_validator(mode="after")
+    def check_targets(self):
+        if len(self.memory_ids) != len(set(self.memory_ids)):
+            raise ValueError("governance IDs must be unique")
+        if self.action == "ADD" and self.memory_ids:
+            raise ValueError("ADD cannot reference existing memories")
+        if self.historical_before_id is not None and self.action != "ADD":
+            raise ValueError("historical boundary is only valid for ADD")
+        if self.action == "DUPLICATE" and len(self.memory_ids) != 1:
+            raise ValueError("DUPLICATE must reference exactly one memory")
+        if self.action in {"SUPERSEDE", "DISPUTE"} and not self.memory_ids:
+            raise ValueError("governance requires at least one existing memory")
+        return self
 
 
 class FactModel(Protocol):
@@ -36,9 +245,13 @@ class FactModel(Protocol):
         self, *, targets: list[dict[str, Any]], history: list[dict[str, Any]]
     ) -> list[ExtractedFact]: ...
 
-    def find_duplicate(
-        self, *, fact: str, candidates: list[dict[str, Any]]
-    ) -> str | None: ...
+    def resolve(
+        self,
+        *,
+        fact: ExtractedFact,
+        candidates: list[dict[str, Any]],
+        targets: list[dict[str, Any]],
+    ) -> GovernanceDecision: ...
 
 
 class Embedder(Protocol):
@@ -67,6 +280,7 @@ class QwenFactModel:
     api_key: str
     base_url: str
     model: str = "qwen3.8-max"
+    output_tokens: int = 2048
 
     def __post_init__(self) -> None:
         self._client = OpenAI(
@@ -74,75 +288,98 @@ class QwenFactModel:
         )
 
     def _json_completion(self, system: str, payload: dict[str, Any]) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for _ in range(3):
-            try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0,
-                    extra_body={"enable_thinking": False},
-                )
-                content = response.choices[0].message.content
-                if not content:
-                    raise ValueError("model returned empty content")
-                return _parse_json_object(content)
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-                last_error = exc
-            except Exception as exc:
-                raise ProviderError(f"Qwen request failed: {exc}") from exc
-        raise ProviderError(f"Qwen returned invalid structured output: {last_error}")
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_tokens=self.output_tokens,
+                extra_body={"enable_thinking": False},
+            )
+            if response.choices[0].finish_reason == "length":
+                raise OutputLimitError("model output was truncated")
+            content = response.choices[0].message.content
+            if not content:
+                raise ProviderError("model returned empty content")
+            return _parse_json_object(content)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Qwen request or output failed: {exc}") from exc
 
     def extract(
         self, *, targets: list[dict[str, Any]], history: list[dict[str, Any]]
     ) -> list[ExtractedFact]:
-        system = (
-            "You extract durable user facts from conversation targets. "
-            "History is context only. Extract only facts newly stated or explicitly confirmed "
-            "by target user messages. Do not treat assistant acknowledgements, system messages, "
-            "or failed/unknown tool results as proof of a user fact. Keep each fact atomic and "
-            "self-contained. Every fact must cite one or more target message_id values. "
-            "Return JSON exactly as {\"facts\":[{\"memory\":str,\"message_ids\":[str]}]}. "
-            "Return an empty facts array when there is no durable fact."
-        )
-        target_ids = {message["message_id"] for message in targets}
         try:
-            output = ExtractionOutput.model_validate(
-                self._json_completion(system, {"history": history, "targets": targets})
-            )
+            raw = self._json_completion(EXTRACTION_PROMPT, {"history": history, "targets": targets})
+            required = {
+                "business_domains",
+                "scope_known",
+                "project_limited",
+                "project_context",
+                "temporal_kind",
+                "change_kind",
+                "effective_at",
+                "expired_at",
+            }
+            output = ExtractionOutput.model_validate(raw)
+            if any(not required.issubset(fact) for fact in raw["facts"]):
+                raise ProviderError("extraction output is missing applicability or temporal fields")
         except ValidationError as exc:
             raise ProviderError(f"invalid extraction output: {exc}") from exc
-        for fact in output.facts:
-            if not set(fact.message_ids).issubset(target_ids):
-                raise ProviderError("extraction output cites a non-target message_id")
+        validate_fact_evidence(output.facts, targets)
         return output.facts
 
-    def find_duplicate(
-        self, *, fact: str, candidates: list[dict[str, Any]]
-    ) -> str | None:
-        system = (
-            "Decide whether the new fact has exactly the same durable meaning as one candidate. "
-            "Related, complementary, temporally changed, corrected, or contradictory facts are "
-            "not duplicates. Similar wording alone is insufficient. Return JSON exactly as "
-            "{\"duplicate_memory_id\": string|null}. The ID must come from candidates."
-        )
+    def select_applicable(
+        self, *, query: str, business_domain: str, candidates: list[dict[str, Any]]
+    ) -> list[str]:
         try:
-            output = DuplicateOutput.model_validate(
-                self._json_completion(system, {"fact": fact, "candidates": candidates})
+            output = ApplicabilityOutput.model_validate(
+                self._json_completion(
+                    APPLICABILITY_PROMPT,
+                    {
+                        "query": query,
+                        "business_domain": business_domain,
+                        "candidates": candidates,
+                    },
+                )
             )
         except ValidationError as exc:
-            raise ProviderError(f"invalid duplicate output: {exc}") from exc
-        candidate_ids = {candidate["id"] for candidate in candidates}
-        if (
-            output.duplicate_memory_id is not None
-            and output.duplicate_memory_id not in candidate_ids
-        ):
-            raise ProviderError("duplicate output cites an unknown memory ID")
-        return output.duplicate_memory_id
+            raise ProviderError(f"invalid applicability output: {exc}") from exc
+        if not set(output.memory_ids).issubset({m["id"] for m in candidates}):
+            raise ProviderError("applicability output cites an unknown memory ID")
+        return list(dict.fromkeys(output.memory_ids))
+
+    def resolve(
+        self,
+        *,
+        fact: ExtractedFact,
+        candidates: list[dict[str, Any]],
+        targets: list[dict[str, Any]],
+    ) -> GovernanceDecision:
+        try:
+            output = GovernanceDecision.model_validate(
+                self._json_completion(
+                    GOVERNANCE_PROMPT,
+                    {
+                        "fact": fact.model_dump(mode="json"),
+                        "candidates": candidates,
+                        "targets": targets,
+                    },
+                )
+            )
+        except ValidationError as exc:
+            raise ProviderError(f"invalid governance output: {exc}") from exc
+        referenced = set(output.memory_ids)
+        if output.historical_before_id:
+            referenced.add(output.historical_before_id)
+        if not referenced.issubset({candidate["id"] for candidate in candidates}):
+            raise ProviderError("governance output cites an unknown memory ID")
+        return output
 
 
 @dataclass

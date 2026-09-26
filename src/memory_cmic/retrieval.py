@@ -6,6 +6,7 @@ from sqlalchemy import Select, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from memory_cmic.models import MemoryEmbedding, MemoryItem
+from memory_cmic.providers import ApplicabilityModel, ProviderError, normalize_business_domain
 
 
 def _scope_filters(
@@ -14,6 +15,7 @@ def _scope_filters(
     business_domain: str,
     project_id: str | None,
     now: datetime,
+    semantic: bool = False,
 ) -> tuple[object, ...]:
     project_filter = MemoryItem.project_domains.is_(None)
     if project_id is not None:
@@ -23,11 +25,19 @@ def _scope_filters(
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.status == "active",
         or_(MemoryItem.expired_at.is_(None), MemoryItem.expired_at > now),
-        or_(
+        literal(True)
+        if semantic
+        else or_(
             MemoryItem.business_domains.is_(None),
-            MemoryItem.business_domains.any(business_domain),
+            MemoryItem.business_domains.any(normalize_business_domain(business_domain)),
         ),
         project_filter,
+        literal(True)
+        if semantic
+        else or_(
+            MemoryItem.metadata_json["project_context"].as_string().is_(None),
+            MemoryItem.project_domains.is_not(None),
+        ),
     )
 
 
@@ -98,18 +108,47 @@ def search_memories(
     query_embedding: list[float] | None = None,
     limit: int = 10,
     now: datetime | None = None,
+    query: str | None = None,
+    applicability_model: ApplicabilityModel | None = None,
 ) -> list[MemoryItem]:
     """Return eligible user, Agent and company memories, optionally vector-ranked."""
     if limit <= 0:
         raise ValueError("limit must be positive")
     if query_embedding is not None and model_id is None:
         raise ValueError("model_id is required for vector search")
+    if (query is None) != (applicability_model is None) or (
+        query is not None and not query.strip()
+    ):
+        raise ValueError("semantic applicability requires a nonempty query and applicability_model")
+
+    def applicable(memories: list[MemoryItem]) -> list[MemoryItem]:
+        if applicability_model is None or not memories:
+            return memories[:limit]
+        ids = applicability_model.select_applicable(
+            query=query,
+            business_domain=normalize_business_domain(business_domain),
+            candidates=[
+                {
+                    "id": m.id,
+                    "memory": m.content,
+                    "business_domains": m.business_domains,
+                    "project_context": (m.metadata_json or {}).get("project_context"),
+                }
+                for m in memories
+            ],
+        )
+        if not set(ids).issubset({m.id for m in memories}):
+            raise ProviderError("applicability output cites an unknown memory ID")
+        return [m for m in memories if m.id in ids][:limit]
+
+    candidate_limit = max(30, limit * 3) if applicability_model is not None else limit
 
     scope_filters = _scope_filters(
         tenant_id=tenant_id,
         business_domain=business_domain,
         project_id=project_id,
         now=now or datetime.now(UTC),
+        semantic=applicability_model is not None,
     )
     routes = _subject_routes(
         user_id=user_id,
@@ -123,7 +162,9 @@ def search_memories(
             statement = select(MemoryItem).where(*scope_filters, *route).order_by(MemoryItem.id)
             for memory in session.scalars(statement):
                 memories[memory.id] = memory
-        return [memories[memory_id] for memory_id in sorted(memories)]
+        ordered = [memories[memory_id] for memory_id in sorted(memories)]
+        # Preserve the existing unranked listing behavior for exact scope callers.
+        return applicable(ordered[:candidate_limit]) if applicability_model is not None else ordered
 
     ranked: dict[str, tuple[MemoryItem, float]] = {}
     for route in routes:
@@ -132,7 +173,7 @@ def search_memories(
             scope_filters=scope_filters,
             model_id=model_id,
             query_embedding=query_embedding,
-            limit=limit,
+            limit=candidate_limit,
         )
         for memory, distance in session.execute(statement):
             previous = ranked.get(memory.id)
@@ -140,4 +181,4 @@ def search_memories(
                 ranked[memory.id] = (memory, distance)
 
     ordered = sorted(ranked.values(), key=lambda item: (item[1], item[0].id))
-    return [memory for memory, _ in ordered[:limit]]
+    return applicable([memory for memory, _ in ordered[:candidate_limit]])

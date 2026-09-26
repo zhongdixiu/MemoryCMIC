@@ -21,7 +21,7 @@ from memory_cmic.models import (
     MemoryTaskSource,
     SourceRecord,
 )
-from memory_cmic.providers import ExtractedFact
+from memory_cmic.providers import ExtractedFact, GovernanceDecision
 from memory_cmic.settings import Settings
 from memory_cmic.worker import run_once
 
@@ -42,6 +42,12 @@ class FakeFactModel:
     def find_duplicate(self, *, fact: str, candidates: list[dict]) -> str | None:
         self.duplicate_checks.append(candidates)
         return candidates[0]["id"] if self.duplicate_semantic_candidates else None
+
+
+    def resolve(self, *, fact, candidates, targets):
+        duplicate = self.find_duplicate(fact=fact.memory, candidates=candidates)
+        return GovernanceDecision(action="DUPLICATE" if duplicate else "ADD",
+                                  memory_ids=[duplicate] if duplicate else [])
 
 
 class FakeEmbedder:
@@ -209,3 +215,303 @@ def test_high_similarity_is_classified_instead_of_hard_dropped(
                 MemoryItem.tenant_id == tenant_id
             )
         ) == 2
+def test_fact_worker_leaves_high_priority_cleanup_pending(worker_context, engine):
+    client, tenant_id = worker_context
+    task_id = _add(client, key="mixed", message_id="mixed", content="我喜欢简洁邮件。")
+    with Session(engine) as session:
+        session.add(
+            MemoryTask(
+                id=f"cleanup_{tenant_id}",
+                tenant_id=tenant_id,
+                task_type="vector_delete",
+                target_type="memory",
+                target_id="unused",
+                idempotency_key="cleanup",
+                priority=100,
+            )
+        )
+        session.commit()
+    _run(engine, FakeFactModel())
+    with Session(engine) as session:
+        assert session.get(MemoryTask, task_id).status == "succeeded"
+        cleanup = session.get(MemoryTask, f"cleanup_{tenant_id}")
+        assert cleanup.status == "pending"
+        assert cleanup.worker_id is None
+
+
+class ChangingFactModel(FakeFactModel):
+    def __init__(self, change):
+        super().__init__()
+        self.change = change
+
+    def extract(self, *, targets, history):
+        self.change()
+        return super().extract(targets=targets, history=history)
+
+
+@pytest.mark.parametrize("change", ["status", "version", "payload", "association"])
+def test_input_changes_during_model_call_cannot_commit(worker_context, engine, change):
+    client, tenant_id = worker_context
+    task_id = _add(client, key="stale", message_id="stale", content="我喜欢简洁邮件。")
+
+    def mutate():
+        with Session(engine) as session:
+            if change in {"status", "version"}:
+                source = session.scalars(
+                    select(SourceRecord).where(
+                        SourceRecord.tenant_id == tenant_id,
+                    )
+                ).one()
+                if change == "status":
+                    source.status = "deleted"
+                else:
+                    source.version += 1
+            elif change == "payload":
+                session.get(MemoryTask, task_id).payload = {"config_version": 2}
+            else:
+                association = session.scalars(
+                    select(MemoryTaskSource).where(
+                        MemoryTaskSource.task_id == task_id,
+                    )
+                ).one()
+                association.position += 1
+            session.commit()
+
+    _run(engine, ChangingFactModel(mutate))
+    with Session(engine) as session:
+        assert session.get(MemoryTask, task_id).status == "failed"
+        assert session.get(MemoryTask, task_id).error_json["code"] == "INPUT_PROCESSING_FAILED"
+        assert not session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.tenant_id == tenant_id,
+            )
+        ).all()
+        source = session.scalars(
+            select(SourceRecord).where(
+                SourceRecord.tenant_id == tenant_id,
+            )
+        ).one()
+        assert source.processed_version is None
+
+
+@pytest.mark.parametrize("role", ["assistant", "system", "tool"])
+def test_worker_rejects_non_user_only_evidence(worker_context, engine, role):
+    client, tenant_id = worker_context
+    task_id = _add(client, key="role", message_id="role", content="我喜欢简洁邮件。")
+    with Session(engine) as session:
+        source = session.scalars(
+            select(SourceRecord).where(
+                SourceRecord.tenant_id == tenant_id,
+            )
+        ).one()
+        source.metadata_json = {**source.metadata_json, "role": role}
+        session.commit()
+
+    class NonUserFactModel(FakeFactModel):
+        def extract(self, *, targets, history):
+            return [ExtractedFact(memory="用户喜欢简洁邮件。", message_ids=["role"])]
+
+    _run(engine, NonUserFactModel())
+    with Session(engine) as session:
+        task = session.get(MemoryTask, task_id)
+        assert task.status == "pending"
+        assert task.attempt_count == 1
+        assert not session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.tenant_id == tenant_id,
+            )
+        ).all()
+
+
+@pytest.mark.parametrize("change", ["version", "status", "content", "expired"])
+def test_changed_duplicate_candidate_retries_without_evidence(worker_context, engine, change):
+    from datetime import UTC, datetime, timedelta
+
+    client, tenant_id = worker_context
+    _add(client, key="candidate-1", message_id="candidate-1", content="我喜欢简洁邮件。")
+    _run(engine, FakeFactModel())
+    task_id = _add(client, key="candidate-2", message_id="candidate-2", content="请简洁回复邮件。")
+
+    class ChangedDuplicateModel(FakeFactModel):
+        def find_duplicate(self, *, fact, candidates):
+            with Session(engine) as session:
+                memory = session.get(MemoryItem, candidates[0]["id"])
+                if change == "version":
+                    memory.version += 1
+                elif change == "status":
+                    memory.status = "invalidated"
+                elif change == "content":
+                    memory.content = "我需要详细邮件。"
+                else:
+                    memory.expired_at = datetime.now(UTC) - timedelta(seconds=1)
+                session.commit()
+            return candidates[0]["id"]
+
+    _run(engine, ChangedDuplicateModel())
+    with Session(engine) as session:
+        assert session.get(MemoryTask, task_id).status == "pending"
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(MemoryEvidence)
+                .where(
+                    MemoryEvidence.tenant_id == tenant_id,
+                )
+            )
+            == 1
+        )
+
+
+def test_same_worker_takeover_blocks_old_result(worker_context, engine):
+    from datetime import UTC, datetime, timedelta
+
+    from memory_cmic.task_queue import claim_tasks
+
+    client, tenant_id = worker_context
+    task_id = _add(client, key="takeover", message_id="takeover", content="我喜欢简洁邮件。")
+
+    def takeover():
+        with Session(engine) as session:
+            task = session.get(MemoryTask, task_id)
+            old_token = task.lease_token
+            task.locked_until = datetime.now(UTC) - timedelta(seconds=1)
+            session.flush()
+            claimed = claim_tasks(
+                session,
+                tenant_id=tenant_id,
+                worker_id=task.worker_id,
+                task_types=("fact_extract",),
+            )
+            assert claimed[0].lease_token != old_token
+            session.commit()
+
+    _run(engine, ChangingFactModel(takeover))
+    with Session(engine) as session:
+        assert session.get(MemoryTask, task_id).status == "processing"
+        assert not session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.tenant_id == tenant_id,
+            )
+        ).all()
+
+
+def test_long_model_call_renews_lease_and_completes(worker_context, engine):
+    import time
+
+    from memory_cmic.task_queue import claim_tasks
+    from memory_cmic.worker import process_task
+
+    client, tenant_id = worker_context
+    task_id = _add(client, key="long", message_id="long", content="我喜欢简洁邮件。")
+    factory = sessionmaker(engine, expire_on_commit=False)
+    with factory.begin() as session:
+        task = claim_tasks(
+            session,
+            tenant_id=tenant_id,
+            worker_id="long_worker",
+            lease_seconds=1,
+            task_types=("fact_extract",),
+        )[0]
+        token = task.lease_token
+        original_until = task.locked_until
+
+    def wait_for_renewal():
+        time.sleep(1.5)
+        with factory() as session:
+            assert session.get(MemoryTask, task_id).locked_until > original_until
+            assert claim_tasks(session, tenant_id=tenant_id, worker_id="takeover") == []
+
+    process_task(
+        factory,
+        task_id=task_id,
+        tenant_id=tenant_id,
+        worker_id="long_worker",
+        lease_token=token,
+        fact_model=ChangingFactModel(wait_for_renewal),
+        embedder=FakeEmbedder(),
+        duplicate_threshold=0.85,
+        lease_seconds=1,
+    )
+    with factory() as session:
+        assert session.get(MemoryTask, task_id).status == "succeeded"
+
+
+def test_failed_prior_batch_blocks_then_recovery_allows_following(worker_context, engine):
+    client, tenant_id = worker_context
+    first = _add(client, key="prior-1", message_id="prior-1", content="我喜欢简洁邮件。")
+    second = _add(client, key="prior-2", message_id="prior-2", content="我喜欢项目符号。")
+    with Session(engine) as session:
+        session.get(MemoryTask, first).status = "failed"
+        session.commit()
+    _run(engine, FakeFactModel())
+    with Session(engine) as session:
+        assert session.get(MemoryTask, second).error_json["code"] == "PRIOR_TASK_FAILED"
+        for task_id in (first, second):
+            task = session.get(MemoryTask, task_id)
+            task.status = "pending"
+            task.worker_id = None
+            task.lease_token = None
+            task.locked_until = None
+            task.completed_at = None
+            task.error_json = None
+        session.commit()
+    _run(engine, FakeFactModel())
+    _run(engine, FakeFactModel())
+    with Session(engine) as session:
+        assert session.get(MemoryTask, first).status == "succeeded"
+        assert session.get(MemoryTask, second).status == "succeeded"
+
+
+def test_expired_lease_during_commit_rolls_back_all_results(worker_context, engine, monkeypatch):
+    import time
+
+    from memory_cmic import worker
+    from memory_cmic.task_queue import claim_tasks
+
+    client, tenant_id = worker_context
+    task_id = _add(
+        client, key="commit-expiry", message_id="commit-expiry", content="我喜欢简洁邮件。"
+    )
+    factory = sessionmaker(engine, expire_on_commit=False)
+    with factory.begin() as session:
+        task = claim_tasks(
+            session,
+            tenant_id=tenant_id,
+            worker_id="slow_commit",
+            lease_seconds=1,
+            task_types=("fact_extract",),
+        )[0]
+        token = task.lease_token
+    original_commit = worker._commit_results
+
+    def slow_commit(*args, **kwargs):
+        results = original_commit(*args, **kwargs)
+        time.sleep(1.2)
+        return results
+
+    monkeypatch.setattr(worker, "_commit_results", slow_commit)
+    with pytest.raises(worker.LeaseLostError):
+        worker.process_task(
+            factory,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            worker_id="slow_commit",
+            lease_token=token,
+            fact_model=FakeFactModel(),
+            embedder=FakeEmbedder(),
+            duplicate_threshold=0.85,
+            lease_seconds=1,
+        )
+    with factory() as session:
+        for model in (MemoryItem, MemoryEvidence, MemoryEmbedding):
+            assert not session.scalars(select(model).where(model.tenant_id == tenant_id)).all()
+        assert not session.scalars(select(MemoryAuditLog).where(
+            MemoryAuditLog.tenant_id == tenant_id,
+            MemoryAuditLog.reason_code == "FACT_EXTRACTED",
+        )).all()
+        source = session.scalars(
+            select(SourceRecord).where(
+                SourceRecord.tenant_id == tenant_id,
+            )
+        ).one()
+        assert source.processed_version is None

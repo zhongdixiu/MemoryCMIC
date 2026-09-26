@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import bindparam, func, select, text, update
 from sqlalchemy.orm import Session
 
 from memory_cmic.models import MemoryItem, MemoryTask
@@ -39,20 +39,26 @@ def claim_tasks(
     worker_id: str,
     limit: int = 1,
     lease_seconds: int = 60,
+    task_types: tuple[str, ...] | None = None,
 ) -> list[MemoryTask]:
     if limit <= 0:
         raise ValueError("limit must be positive")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
+    if task_types == ():
+        return []
+
+    type_filter = "AND candidate.task_type IN :task_types" if task_types else ""
 
     claimed_ids = list(
         session.execute(
             text(
-                """
+                f"""
                 WITH candidates AS (
                     SELECT id
                     FROM memory_task AS candidate
                     WHERE candidate.tenant_id = :tenant_id
+                      {type_filter}
                       AND (
                            (candidate.status = 'pending'
                             AND candidate.available_at <= CURRENT_TIMESTAMP)
@@ -95,12 +101,13 @@ def claim_tasks(
                 WHERE task.id = candidates.id
                 RETURNING task.id
                 """
-            ),
+            ).bindparams(*([bindparam("task_types", expanding=True)] if task_types else [])),
             {
                 "tenant_id": tenant_id,
                 "worker_id": worker_id,
                 "limit": limit,
                 "lease_seconds": lease_seconds,
+                **({"task_types": task_types} if task_types else {}),
             },
         ).scalars()
     )
@@ -125,6 +132,7 @@ def renew_task_lease(
     task_id: str,
     worker_id: str,
     lease_seconds: int,
+    lease_token: str | None = None,
 ) -> bool:
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
@@ -132,14 +140,15 @@ def renew_task_lease(
         text(
             """
             UPDATE memory_task
-            SET locked_until = GREATEST(locked_until, CURRENT_TIMESTAMP)
-                               + make_interval(secs => :lease_seconds),
+            SET locked_until = clock_timestamp() + make_interval(secs => :lease_seconds),
                 updated_at = CURRENT_TIMESTAMP
             WHERE tenant_id = :tenant_id
               AND id = :task_id
               AND status = 'processing'
               AND worker_id = :worker_id
-              AND locked_until > CURRENT_TIMESTAMP
+              AND (CAST(:lease_token AS VARCHAR) IS NULL
+                   OR lease_token = CAST(:lease_token AS VARCHAR))
+              AND locked_until > clock_timestamp()
             """
         ),
         {
@@ -147,6 +156,7 @@ def renew_task_lease(
             "task_id": task_id,
             "worker_id": worker_id,
             "lease_seconds": lease_seconds,
+            "lease_token": lease_token,
         },
     )
     session.expire_all()
@@ -207,7 +217,9 @@ def fail_and_retry_task(
             UPDATE memory_task
             SET attempt_count = attempt_count + 1,
                 status = CASE
-                    WHEN attempt_count + 1 >= max_attempts THEN 'failed'
+                    WHEN attempt_count + 1 >= max_attempts THEN
+                        CASE WHEN payload->'execution'->>'changed' = 'true'
+                             THEN 'partial' ELSE 'failed' END
                     ELSE 'pending'
                 END,
                 available_at = CASE
@@ -248,7 +260,7 @@ def fail_and_retry_task(
               AND worker_id = :worker_id
               AND (CAST(:lease_token AS VARCHAR) IS NULL
                    OR lease_token = CAST(:lease_token AS VARCHAR))
-              AND locked_until > CURRENT_TIMESTAMP
+              AND locked_until > clock_timestamp()
             RETURNING id
             """
         ),
@@ -289,7 +301,7 @@ def finish_task(
             MemoryTask.status == "processing",
             MemoryTask.worker_id == worker_id,
             MemoryTask.lease_token == lease_token,
-            MemoryTask.locked_until > func.current_timestamp(),
+            MemoryTask.locked_until > func.clock_timestamp(),
         )
         .values(
             status=status,
