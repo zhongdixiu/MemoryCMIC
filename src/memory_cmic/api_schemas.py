@@ -172,5 +172,24 @@ class TaskResponse(BaseModel):
     error: ErrorInfo | None
 
 
+class GovernancePolicyPatch(StrictRequestModel):
+    auto_enabled: bool | None = None
+    change_threshold: int | None = Field(default=None, ge=1, le=10000)
+    idle_minutes: int | None = Field(default=None, ge=0, le=10080)
+    cooldown_minutes: int | None = Field(default=None, ge=0, le=10080)
+    max_wait_minutes: int | None = Field(default=None, ge=1, le=43200)
+    max_memories: int | None = Field(default=None, ge=1, le=1000)
+    max_model_calls: int | None = Field(default=None, ge=1, le=100)
+
+
+class GovernanceRunRequest(StrictRequestModel):
+    user_id: str = Field(min_length=1, max_length=128)
+
+
+class GovernanceRevertRequest(StrictRequestModel):
+    reason: str = Field(min_length=1, max_length=512)
+    expected_version: int = Field(ge=1)
+
+
 class ErrorBody(BaseModel):
     error: ErrorInfo

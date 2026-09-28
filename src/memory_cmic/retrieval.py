@@ -24,6 +24,7 @@ def _scope_filters(
     return (
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.status == "active",
+        MemoryItem.effective_at <= now,
         or_(MemoryItem.expired_at.is_(None), MemoryItem.expired_at > now),
         literal(True)
         if semantic

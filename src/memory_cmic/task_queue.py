@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import bindparam, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from memory_cmic.models import MemoryItem, MemoryTask
@@ -26,10 +27,52 @@ def enqueue_task(session: Session, data: Mapping[str, Any]) -> MemoryTask:
     if existing is not None:
         return existing
 
+    if caller_agent_id is None:
+        inserted_id = session.scalar(
+            pg_insert(MemoryTask)
+            .values(**dict(data))
+            .on_conflict_do_nothing(
+                index_elements=["tenant_id", "idempotency_key"],
+                index_where=MemoryTask.caller_agent_id.is_(None),
+            )
+            .returning(MemoryTask.id)
+        )
+        if inserted_id is None:
+            return session.scalars(
+                select(MemoryTask).where(
+                    MemoryTask.tenant_id == data["tenant_id"],
+                    MemoryTask.caller_agent_id.is_(None),
+                    MemoryTask.idempotency_key == data["idempotency_key"],
+                )
+            ).one()
+        return session.get(MemoryTask, inserted_id)
+
     task = MemoryTask(**dict(data))
     session.add(task)
     session.flush()
     return task
+
+
+def finish_exhausted_leases(session: Session) -> int:
+    result = session.execute(
+        text(
+            """
+            UPDATE memory_task
+            SET status = CASE WHEN payload->'execution'->>'changed' = 'true'
+                              THEN 'partial' ELSE 'failed' END,
+                completed_at = clock_timestamp(),
+                error = jsonb_build_object('code', 'LEASE_EXHAUSTED',
+                                           'message', 'task lease expired after final attempt'),
+                last_error = 'task lease expired after final attempt',
+                worker_id = NULL, lease_token = NULL, locked_until = NULL,
+                updated_at = clock_timestamp()
+            WHERE status = 'processing'
+              AND locked_until < clock_timestamp()
+              AND attempt_count >= max_attempts
+            """
+        )
+    )
+    return result.rowcount
 
 
 def claim_tasks(

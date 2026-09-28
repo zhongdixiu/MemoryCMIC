@@ -3,21 +3,31 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from memory_cmic.api_schemas import AddRequest, ErrorBody, ErrorInfo, TaskResponse
+from memory_cmic.api_schemas import (
+    AddRequest,
+    ErrorBody,
+    ErrorInfo,
+    GovernancePolicyPatch,
+    GovernanceRevertRequest,
+    GovernanceRunRequest,
+    TaskResponse,
+)
 from memory_cmic.auth import (
     AuthContext,
     AuthenticationError,
     AuthorizationError,
 )
+from memory_cmic.consolidation import RevertConflict, revert_operation
 from memory_cmic.db import create_database_engine
+from memory_cmic.governance_state import backfill_history, backfill_user, create_run, ensure_policy
 from memory_cmic.ingest import IngestError, ingest_and_enqueue
-from memory_cmic.models import MemoryTask
+from memory_cmic.models import GovernanceOperation, GovernancePolicy, MemoryAuditLog, MemoryTask
 from memory_cmic.settings import Settings
 from memory_cmic.task_results import to_task_response
 
@@ -100,6 +110,191 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             return resolved_settings.credentials.authenticate(authorization)
         except AuthenticationError as exc:
             raise ApiError(401, "UNAUTHENTICATED", str(exc)) from exc
+
+    def manage_governance(auth: AuthContext = Depends(authenticate)) -> AuthContext:
+        if not auth.can_manage_governance:
+            raise ApiError(403, "FORBIDDEN", "governance management permission is required")
+        return auth
+
+    def policy_body(policy: GovernancePolicy) -> dict:
+        return {
+            "auto_enabled": policy.auto_enabled,
+            "change_threshold": policy.change_threshold,
+            "idle_minutes": policy.idle_minutes,
+            "cooldown_minutes": policy.cooldown_minutes,
+            "max_wait_minutes": policy.max_wait_minutes,
+            "max_memories": policy.max_memories,
+            "max_model_calls": policy.max_model_calls,
+            "version": policy.version,
+        }
+
+    def run_body(task: MemoryTask) -> dict:
+        execution = task.payload or {}
+        return {
+            "task_id": task.id, "user_id": task.user_id,
+            "status": task.status, "automatic": execution.get("automatic", False),
+            "trigger_reason": execution.get("trigger_reason"),
+            "policy_version": execution.get("policy_version"),
+            "processed": execution.get("cursor", 0),
+            "selected": len(execution.get("selection", [])),
+            "input_memory_ids": [row[0] for row in execution.get("selection", [])],
+            "remaining": execution.get("remaining"),
+            "model_calls": execution.get("model_calls", 0),
+            "token_usage": execution.get("token_usage"),
+            "results": task.result_json or [], "error": task.error_json,
+            "created_at": task.created_at, "started_at": task.started_at,
+            "completed_at": task.completed_at,
+        }
+
+    @app.get("/api/v1/governance/policy")
+    def get_governance_policy(auth: AuthContext = Depends(manage_governance)) -> dict:
+        with session_factory.begin() as session:
+            return policy_body(ensure_policy(session, auth.tenant_id))
+
+    @app.patch("/api/v1/governance/policy")
+    def patch_governance_policy(
+        body: GovernancePolicyPatch, auth: AuthContext = Depends(manage_governance)
+    ) -> dict:
+        changes = body.model_dump(exclude_unset=True)
+        with session_factory.begin() as session:
+            policy = ensure_policy(session, auth.tenant_id)
+            session.refresh(policy, with_for_update=True)
+            before = policy_body(policy)
+            if changes:
+                for field, value in changes.items():
+                    setattr(policy, field, value)
+                policy.version += 1
+                if changes.get("auto_enabled") and not before["auto_enabled"]:
+                    backfill_history(session, auth.tenant_id)
+                session.add(MemoryAuditLog(
+                    tenant_id=auth.tenant_id, action="UPDATE", target_type="task",
+                    target_id=auth.tenant_id, operator_type="admin",
+                    operator_id=auth.caller_agent_id,
+                    reason_code="GOVERNANCE_POLICY_CHANGED",
+                    state_before=before, state_after=policy_body(policy),
+                ))
+            return policy_body(policy)
+
+    @app.post("/api/v1/governance/runs", status_code=202)
+    def trigger_governance_run(
+        body: GovernanceRunRequest, auth: AuthContext = Depends(manage_governance),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict:
+        if idempotency_key is not None and (
+            len(idempotency_key) > 128 or not idempotency_key.isascii()
+        ):
+            raise ApiError(422, "INVALID_IDEMPOTENCY_KEY", "invalid Idempotency-Key")
+        with session_factory.begin() as session:
+            task_key = (
+                f"consolidate:{body.user_id}:{idempotency_key}" if idempotency_key else None
+            )
+            if task_key is not None:
+                previous = session.scalars(select(MemoryTask).where(
+                    MemoryTask.tenant_id == auth.tenant_id,
+                    MemoryTask.caller_agent_id == auth.caller_agent_id,
+                    MemoryTask.idempotency_key == task_key,
+                )).one_or_none()
+                if previous is not None:
+                    return run_body(previous)
+            backfill_user(session, auth.tenant_id, body.user_id)
+            task = create_run(
+                session, tenant_id=auth.tenant_id, user_id=body.user_id,
+                operator_id=auth.caller_agent_id,
+                idempotency_key=task_key,
+            )
+            return run_body(task)
+
+    @app.get("/api/v1/governance/runs")
+    def list_governance_runs(
+        user_id: str | None = None, status: str | None = None,
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        auth: AuthContext = Depends(manage_governance),
+    ) -> dict:
+        with session_factory() as session:
+            query = select(MemoryTask).where(
+                MemoryTask.tenant_id == auth.tenant_id, MemoryTask.task_type == "consolidate"
+            )
+            if user_id is not None:
+                query = query.where(MemoryTask.user_id == user_id)
+            if status is not None:
+                query = query.where(MemoryTask.status == status)
+            tasks = session.scalars(
+                query.order_by(MemoryTask.created_at.desc(), MemoryTask.id.desc())
+                .offset(offset).limit(limit)
+            ).all()
+            return {"runs": [run_body(task) for task in tasks]}
+
+    def get_managed_run(session: Session, tenant_id: str, run_id: str) -> MemoryTask:
+        task = session.get(MemoryTask, run_id)
+        if task is None or task.tenant_id != tenant_id or task.task_type != "consolidate":
+            raise ApiError(404, "TASK_NOT_FOUND", "governance run does not exist")
+        return task
+
+    @app.get("/api/v1/governance/runs/{run_id}")
+    def get_governance_run(
+        run_id: str, auth: AuthContext = Depends(manage_governance)
+    ) -> dict:
+        with session_factory() as session:
+            return run_body(get_managed_run(session, auth.tenant_id, run_id))
+
+    @app.get("/api/v1/governance/runs/{run_id}/operations")
+    def list_governance_operations(
+        run_id: str, limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        auth: AuthContext = Depends(manage_governance),
+    ) -> dict:
+        with session_factory() as session:
+            get_managed_run(session, auth.tenant_id, run_id)
+            operations = session.scalars(select(GovernanceOperation).where(
+                GovernanceOperation.tenant_id == auth.tenant_id,
+                GovernanceOperation.task_id == run_id,
+            ).order_by(GovernanceOperation.created_at, GovernanceOperation.id)
+            .offset(offset).limit(limit)).all()
+            return {"operations": [
+                {"id": op.id, "kind": op.kind, "memory_id": op.memory_id,
+                 "details": op.details, "created_at": op.created_at,
+                 "reverted_at": op.reverted_at}
+                for op in operations
+            ]}
+
+    @app.post("/api/v1/governance/operations/{operation_id}:revert")
+    def revert_governance_operation(
+        operation_id: str, body: GovernanceRevertRequest,
+        auth: AuthContext = Depends(manage_governance),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict:
+        if idempotency_key is not None and (
+            len(idempotency_key) > 128 or not idempotency_key.isascii()
+        ):
+            raise ApiError(422, "INVALID_IDEMPOTENCY_KEY", "invalid Idempotency-Key")
+        with session_factory.begin() as session:
+            operation = session.scalars(select(GovernanceOperation).where(
+                GovernanceOperation.tenant_id == auth.tenant_id,
+                GovernanceOperation.id == operation_id,
+            ).with_for_update()).one_or_none()
+            if operation is None:
+                raise ApiError(404, "OPERATION_NOT_FOUND", "governance operation does not exist")
+            if operation.reverted_at is not None and idempotency_key:
+                previous = session.scalars(select(GovernanceOperation).where(
+                    GovernanceOperation.tenant_id == auth.tenant_id,
+                    GovernanceOperation.kind == "rejection",
+                    GovernanceOperation.details["reverted_operation_id"].as_string()
+                    == operation_id,
+                    GovernanceOperation.details["idempotency_key"].as_string() == idempotency_key,
+                )).first()
+                if previous is not None:
+                    return {"operation_id": previous.id, "reverted_operation_id": operation.id}
+            try:
+                feedback = revert_operation(
+                    session, operation=operation, expected_version=body.expected_version,
+                    operator_id=auth.caller_agent_id, reason=body.reason,
+                    model_id=resolved_settings.siliconflow_embedding_model,
+                    idempotency_key=idempotency_key,
+                )
+            except RevertConflict as exc:
+                raise ApiError(409, "REVERT_CONFLICT", str(exc)) from exc
+            return {"operation_id": feedback.id, "reverted_operation_id": operation.id}
 
     @app.post(
         "/api/v1/memories:add",

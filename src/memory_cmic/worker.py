@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from memory_cmic.db import create_database_engine
 from memory_cmic.extraction_input import ExtractionBudget, build_slices, input_size, split_slice
+from memory_cmic.governance_state import mark_dirty
 from memory_cmic.lifecycle import govern_memory
 from memory_cmic.models import (
     MemoryAuditLog,
@@ -376,6 +378,7 @@ def _add_evidence(
             },
         )
     )
+    mark_dirty(session, session.get(MemoryItem, memory_id), from_add=True)
 
 
 def _scope_filters(fact: ExtractedFact):
@@ -740,6 +743,7 @@ def _commit_results(
                 correlation_id=task.correlation_id,
                 conflict_group_id=conflict_group,
             )
+            mark_dirty(session, old, from_add=True)
         memory = MemoryItem(
             id=decision.memory_id,
             tenant_id=task_input.tenant_id,
@@ -1280,10 +1284,19 @@ def run_once(
 
 
 def main() -> None:
+    from memory_cmic.consolidation import QwenConsolidationModel
+    from memory_cmic.consolidation import run_once as run_consolidation_once
+    from memory_cmic.governance_worker import run_once as run_governance_once
+
     logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description="MemoryCMIC worker")
+    parser.add_argument("--role", choices=("add", "maintenance", "consolidation"), default="add")
+    role = parser.parse_args().role
     settings = Settings.from_env()
-    if not settings.dashscope_api_key or not settings.siliconflow_api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY and SILICONFLOW_API_KEY must be set")
+    if role in {"add", "consolidation"} and not settings.dashscope_api_key:
+        raise RuntimeError("DASHSCOPE_API_KEY must be set")
+    if role in {"add", "maintenance"} and not settings.siliconflow_api_key:
+        raise RuntimeError("SILICONFLOW_API_KEY must be set")
     engine = create_database_engine(settings.database_url)
     session_factory = sessionmaker(engine, expire_on_commit=False)
     fact_model = QwenFactModel(
@@ -1291,12 +1304,19 @@ def main() -> None:
         base_url=settings.dashscope_base_url,
         model=settings.dashscope_model,
         output_tokens=settings.extraction_budget.output_tokens,
-    )
+    ) if role == "add" else None
     embedder = SiliconFlowEmbedder(
         api_key=settings.siliconflow_api_key,
         base_url=settings.siliconflow_base_url,
         model_id=settings.siliconflow_embedding_model,
-    )
+    ) if role in {"add", "maintenance"} else None
+    consolidation_model = QwenConsolidationModel(
+        api_key=settings.dashscope_api_key,
+        base_url=settings.dashscope_base_url,
+        model=settings.dashscope_model,
+        output_tokens=settings.extraction_budget.output_tokens,
+        input_tokens=settings.extraction_budget.input_tokens,
+    ) if role == "consolidation" else None
     worker_id = f"worker_{uuid4().hex}"
     stopping = False
 
@@ -1307,14 +1327,22 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     while not stopping:
-        handled = run_once(
-            session_factory,
-            worker_id=worker_id,
-            fact_model=fact_model,
-            embedder=embedder,
-            duplicate_threshold=settings.duplicate_candidate_threshold,
-            budget=settings.extraction_budget,
-        )
+        if role == "maintenance":
+            handled = run_governance_once(session_factory, worker_id=worker_id, embedder=embedder)
+        elif role == "consolidation":
+            handled = run_consolidation_once(
+                session_factory, worker_id=worker_id, model=consolidation_model,
+                model_id=settings.siliconflow_embedding_model,
+            )
+        else:
+            handled = run_once(
+                session_factory,
+                worker_id=worker_id,
+                fact_model=fact_model,
+                embedder=embedder,
+                duplicate_threshold=settings.duplicate_candidate_threshold,
+                budget=settings.extraction_budget,
+            )
         if not handled:
             time.sleep(1)
 

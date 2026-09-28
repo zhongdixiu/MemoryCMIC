@@ -300,6 +300,8 @@ class QwenFactModel:
                 max_tokens=self.output_tokens,
                 extra_body={"enable_thinking": False},
             )
+            usage = getattr(response, "usage", None)
+            self.last_usage = usage.model_dump() if usage else None
             if response.choices[0].finish_reason == "length":
                 raise OutputLimitError("model output was truncated")
             content = response.choices[0].message.content

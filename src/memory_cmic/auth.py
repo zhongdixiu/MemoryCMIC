@@ -20,6 +20,7 @@ class AuthContext:
     tenant_id: str
     caller_agent_id: str
     allowed_source_systems: frozenset[str]
+    can_manage_governance: bool = False
 
 
 class StaticCredentialStore:
@@ -32,12 +33,16 @@ class StaticCredentialStore:
                 raise ValueError("each credential requires exactly one of token or token_sha256")
             digest = token_sha256 or hashlib.sha256(token.encode()).hexdigest()
             sources = frozenset(item.get("allowed_source_systems") or [])
-            if not sources:
+            manage_governance = item.get("can_manage_governance", False)
+            if not isinstance(manage_governance, bool):
+                raise ValueError("can_manage_governance must be a boolean")
+            if not sources and not manage_governance:
                 raise ValueError("allowed_source_systems must not be empty")
             self._credentials[digest] = AuthContext(
                 tenant_id=item["tenant_id"],
                 caller_agent_id=item["caller_agent_id"],
                 allowed_source_systems=sources,
+                can_manage_governance=manage_governance,
             )
 
     @classmethod

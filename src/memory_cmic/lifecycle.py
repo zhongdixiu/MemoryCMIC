@@ -6,6 +6,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from memory_cmic.governance_state import lock_user, mark_dirty
 from memory_cmic.models import (
     MemoryAuditLog,
     MemoryEmbedding,
@@ -117,7 +118,10 @@ def _enqueue_vector_deletes(
                     f"vector_delete:memory:{memory.id}:v{memory.version}:{embedding.model_id}"
                 ),
                 "correlation_id": correlation_id,
-                "payload": {"model_id": embedding.model_id},
+                "payload": {
+                    "model_id": embedding.model_id,
+                    "content_hash": embedding.content_hash,
+                },
                 "priority": 100,
                 "available_at": now,
             },
@@ -278,13 +282,6 @@ def update_or_invalidate_source(
     source = session.get(SourceRecord, source_id)
     if source is None or source.tenant_id != tenant_id:
         raise LookupError("source does not exist in tenant")
-    old_status = source.status
-    old_version = source.version
-    source.status = status
-    source.version += 1
-    source.updated_at = now or datetime.now(UTC)
-    if status != "active":
-        source.invalidated_at = source.updated_at
     affected_edges = session.scalars(
         select(MemoryEvidence).where(
             MemoryEvidence.tenant_id == tenant_id,
@@ -296,6 +293,24 @@ def update_or_invalidate_source(
         for edge in affected_edges
         if edge.downstream_memory_id is not None
     }
+    users = {
+        memory.subject_id
+        for memory in session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.tenant_id == tenant_id, MemoryItem.id.in_(downstream_ids)
+            )
+        )
+        if memory.subject_type == "user"
+    }
+    for user_id in sorted(users):
+        lock_user(session, tenant_id, user_id)
+    old_status = source.status
+    old_version = source.version
+    source.status = status
+    source.version += 1
+    source.updated_at = now or datetime.now(UTC)
+    if status != "active":
+        source.invalidated_at = source.updated_at
     for edge in affected_edges:
         if edge.status == "active":
             edge.status = "invalidated"
@@ -340,6 +355,9 @@ def update_or_invalidate_source(
             correlation_id=correlation_id,
             now=source.updated_at,
         )
+        affected = session.get(MemoryItem, memory_id)
+        if affected is not None:
+            mark_dirty(session, affected)
     return source
 
 
@@ -354,6 +372,8 @@ def invalidate_memory(
     memory = session.get(MemoryItem, memory_id)
     if memory is None or memory.tenant_id != tenant_id:
         raise LookupError("memory does not exist in tenant")
+    if memory.subject_type == "user":
+        lock_user(session, tenant_id, memory.subject_id)
     if memory.status == "active":
         check_time = now or datetime.now(UTC)
         old_version = memory.version
@@ -419,6 +439,8 @@ def expire_memory(
     memory = session.get(MemoryItem, memory_id)
     if memory is None or memory.tenant_id != tenant_id:
         raise LookupError("memory does not exist in tenant")
+    if memory.subject_type == "user":
+        lock_user(session, tenant_id, memory.subject_id)
     if memory.status != "active":
         return memory
     if memory.expired_at is None or memory.expired_at > check_time:

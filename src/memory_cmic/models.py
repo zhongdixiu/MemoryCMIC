@@ -8,6 +8,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     ARRAY,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
@@ -438,7 +439,8 @@ class MemoryTask(Base):
         CheckConstraint("priority IN (0, 50, 100)", name="ck_task_priority"),
         CheckConstraint(
             "task_type IN ('fact_extract', 'inference_derive', 'profile_rebuild', "
-            "'dependency_recheck', 'vector_upsert', 'vector_delete', 'ttl_expire')",
+            "'dependency_recheck', 'vector_upsert', 'vector_delete', 'ttl_expire', "
+            "'consolidate')",
             name="ck_task_type",
         ),
         CheckConstraint(
@@ -515,6 +517,92 @@ Index(
     MemoryTask.session_id,
     MemoryTask.batch_seq,
 )
+Index(
+    "uq_governance_active_run",
+    MemoryTask.tenant_id,
+    MemoryTask.user_id,
+    unique=True,
+    postgresql_where=text("task_type = 'consolidate' AND status IN ('pending', 'processing')"),
+)
+Index(
+    "uq_system_task_key",
+    MemoryTask.tenant_id,
+    MemoryTask.idempotency_key,
+    unique=True,
+    postgresql_where=text("caller_agent_id IS NULL"),
+)
+
+
+class GovernancePolicy(Base):
+    __tablename__ = "governance_policy"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    auto_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    change_threshold: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
+    idle_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("10"))
+    cooldown_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("60")
+    )
+    max_wait_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("360")
+    )
+    max_memories: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("100"))
+    max_model_calls: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("10"))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class GovernanceSubjectState(Base):
+    __tablename__ = "governance_subject_state"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "user_id"),)
+
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    user_id: Mapped[str] = mapped_column(String(128))
+    last_add_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class GovernancePending(Base):
+    __tablename__ = "governance_pending"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "user_id", "memory_id"),)
+
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    user_id: Mapped[str] = mapped_column(String(128))
+    memory_id: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    first_change_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class GovernanceOperation(Base):
+    __tablename__ = "governance_operation"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    memory_id: Mapped[str | None] = mapped_column(String(64))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    reverted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+Index("ix_governance_operation_task", GovernanceOperation.tenant_id, GovernanceOperation.task_id)
+Index("ix_governance_pending_age", GovernancePending.tenant_id, GovernancePending.first_change_at)
 
 
 class MemoryTaskSource(Base):

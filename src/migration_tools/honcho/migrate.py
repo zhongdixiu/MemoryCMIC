@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,7 +38,14 @@ def main() -> None:
             engine = target_engine()
             try:
                 with Session(engine) as session, session.begin():
-                    report = apply_migration(session, batch, migration_batch_id=migration_batch_id)
+                    report = apply_migration(
+                        session,
+                        batch,
+                        migration_batch_id=migration_batch_id,
+                        embedding_model_id=os.environ.get(
+                            "SILICONFLOW_EMBEDDING_MODEL", "BAAI/bge-m3"
+                        ),
+                    )
             finally:
                 engine.dispose()
             report["mode"] = "migrate"

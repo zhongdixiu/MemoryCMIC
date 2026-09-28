@@ -375,6 +375,7 @@ def _ensure_vector_task(
     *,
     memory_id: str,
     correlation_id: str,
+    model_id: str,
 ) -> bool:
     idempotency_key = f"vector_upsert:memory:{memory_id}:v1"
     existing = session.scalar(
@@ -395,7 +396,7 @@ def _ensure_vector_task(
             input_version=1,
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
-            payload={"source_system": "honcho"},
+            payload={"source_system": "honcho", "model_id": model_id},
             status="pending",
             priority=0,
         )
@@ -408,6 +409,7 @@ def apply_migration(
     batch: MigrationBatch,
     *,
     migration_batch_id: str,
+    embedding_model_id: str = "BAAI/bge-m3",
 ) -> dict[str, Any]:
     correlation_id = stable_id("hcorr", batch.tenant_id, migration_batch_id)
     inserted = {
@@ -527,6 +529,7 @@ def apply_migration(
                 batch,
                 memory_id=downstream_id,
                 correlation_id=correlation_id,
+                model_id=embedding_model_id,
             )
         )
 
